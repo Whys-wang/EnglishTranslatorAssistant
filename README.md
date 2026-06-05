@@ -2,7 +2,7 @@
 
 把单向外语音频流实时翻译成**中文双语字幕**(可选 TTS 语音)的助手。核心难点是**低延迟**与**自动纠正此前的识别/翻译错误**。
 
-> 当前进度:里程碑 1 —— 项目脚手架 & 空链路打通。
+> 当前进度:里程碑 2 —— 前端音频采集与分片(tabCapture → 16k PCM → WebSocket)。
 
 ## 架构
 
@@ -80,7 +80,7 @@ curl http://localhost:8765/healthz
 2. 「加载已解压的扩展程序」,选择本仓库的 `extension/` 目录。
 3. 打开任意带音频的标签页,点击扩展图标 →「开始翻译」。
 
-里程碑 1 阶段:点击「开始」后,offscreen 会连上后端 `ws://localhost:8765/ws` 并完成 `start/ack` 握手,后端日志可见连接与控制消息(空链路验证)。
+点击「开始」后:offscreen 连上后端 `ws://localhost:8765/ws`,发送 `start`(含音频参数),并开始用 AudioWorklet 把标签页音频重采样为 16kHz/16bit/单声道 PCM、按 ~100ms 分片以二进制帧持续发送;断线会指数退避自动重连。后端日志(`audio received`)会打印累计帧数、字节数与按 16kHz 估算的音频时长,可据此核对采样率是否正确。
 
 ## 如何演示
 
@@ -89,7 +89,7 @@ curl http://localhost:8765/healthz
 ## 开发计划
 
 1. [x] chore: 项目脚手架(前后端目录、写死配置、README 骨架)
-2. [ ] feat: 前端音频采集与分片(tabCapture→16k PCM→WebSocket)
+2. [x] feat: 前端音频采集与分片(tabCapture→16k PCM→WebSocket)
 3. [ ] feat: 接入火山 ASR 流式(二进制协议解析,partial/final)
 4. [ ] feat: 接入方舟翻译(分句、上下文窗口、回填 segment)
 5. [ ] feat: 双语字幕 UI(partial 灰显、final 定稿、原地更新)

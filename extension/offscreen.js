@@ -1,46 +1,97 @@
 // offscreen.js —— 在 offscreen 文档中执行音频采集与 WebSocket 推流。
 //
-// 里程碑 1:建立到后端的 WebSocket 连接,完成「start/ack」控制握手以验证空链路。
-// 里程碑 2:用 AudioWorklet 把标签页音频重采样为 16kHz/16bit/单声道 PCM,
-//          按 ~100ms 分片以二进制帧发送。
+// 里程碑 2:
+//   - 用 tabCapture 媒体流创建 AudioContext,接 AudioWorklet 重采样为 16kHz PCM;
+//   - 同时把原始音频接到扬声器,保证用户仍能听到标签页声音;
+//   - worklet 输出的 PCM(Int16, ~100ms/帧)以二进制帧经 WebSocket 发往后端;
+//   - WebSocket 断线指数退避自动重连;断开期间丢弃实时帧(不积压,保低延迟)。
 
 const BACKEND_WS_URL = "ws://localhost:8765/ws";
+const TARGET_SAMPLE_RATE = 16000;
+
+// 指数退避重连参数(与后端 config.Reconnect 保持一致量级)。
+const RECONNECT = {
+  initialMs: 500,
+  maxMs: 15000,
+  multiplier: 2,
+};
 
 let ws = null;
 let audioContext = null;
 let mediaStream = null;
+let sourceNode = null;
 let workletNode = null;
 
+let running = false; // 是否处于「采集中」(stop 后为 false,停止重连)。
+let reconnectDelay = RECONNECT.initialMs;
+let reconnectTimer = null;
+
+function wsConnected() {
+  return ws && ws.readyState === WebSocket.OPEN;
+}
+
+function scheduleReconnect() {
+  if (!running) return;
+  if (reconnectTimer) return;
+  const delay = reconnectDelay;
+  console.warn(`[offscreen] WS 断开,${delay}ms 后重连`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    reconnectDelay = Math.min(reconnectDelay * RECONNECT.multiplier, RECONNECT.maxMs);
+    connectBackend();
+  }, delay);
+}
+
 function connectBackend() {
-  return new Promise((resolve, reject) => {
-    ws = new WebSocket(BACKEND_WS_URL);
-    ws.binaryType = "arraybuffer";
-    ws.onopen = () => {
-      ws.send(JSON.stringify({ type: "start" }));
-      resolve();
-    };
-    ws.onerror = (e) => reject(e);
-    ws.onmessage = (ev) => {
-      if (typeof ev.data !== "string") return;
-      let msg;
-      try {
-        msg = JSON.parse(ev.data);
-      } catch {
-        return;
-      }
-      // 后端回传的字幕事件 -> 交给 background 转发到页面 overlay。
-      if (msg.type === "subtitle") {
-        chrome.runtime.sendMessage({ target: "page-subtitle", ...msg });
-      }
-    };
-    ws.onclose = () => {
-      ws = null;
-    };
-  });
+  ws = new WebSocket(BACKEND_WS_URL);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    reconnectDelay = RECONNECT.initialMs; // 成功后重置退避。
+    // 告知后端音频参数,便于上游 ASR 配置。
+    ws.send(
+      JSON.stringify({
+        type: "start",
+        audio: {
+          sampleRate: TARGET_SAMPLE_RATE,
+          bitDepth: 16,
+          channels: 1,
+          format: "pcm_s16le",
+        },
+      })
+    );
+    console.info("[offscreen] WS 已连接");
+  };
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data !== "string") return;
+    let msg;
+    try {
+      msg = JSON.parse(ev.data);
+    } catch {
+      return;
+    }
+    // 后端回传的字幕事件 -> 交给 background 转发到页面 overlay。
+    if (msg.type === "subtitle") {
+      chrome.runtime.sendMessage({ target: "page-subtitle", ...msg });
+    }
+  };
+
+  ws.onerror = () => {
+    // 错误后通常会触发 onclose,由 onclose 统一安排重连。
+  };
+
+  ws.onclose = () => {
+    ws = null;
+    scheduleReconnect();
+  };
 }
 
 async function start(streamId) {
-  await connectBackend();
+  if (running) stop(); // 幂等:先清理旧会话。
+  running = true;
+  reconnectDelay = RECONNECT.initialMs;
+  connectBackend();
 
   // 用 tab 媒体流 id 获取音频流。
   mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -54,22 +105,42 @@ async function start(streamId) {
   });
 
   audioContext = new AudioContext();
+  sourceNode = audioContext.createMediaStreamSource(mediaStream);
   // 关键:保持把标签页声音播放给用户(否则会静音)。
-  const source = audioContext.createMediaStreamSource(mediaStream);
-  source.connect(audioContext.destination);
+  sourceNode.connect(audioContext.destination);
 
-  // TODO(里程碑 2): 加载 audio-worklet.js,在 worklet 内重采样为 16kHz PCM,
-  // 通过 port 把分片回传到这里再经 ws.send 发送二进制帧。
-  // await audioContext.audioWorklet.addModule(chrome.runtime.getURL("audio-worklet.js"));
-  // workletNode = new AudioWorkletNode(audioContext, "pcm16k-downsampler");
-  // source.connect(workletNode);
-  // workletNode.port.onmessage = (e) => { if (ws?.readyState === 1) ws.send(e.data); };
+  // 加载重采样 worklet。
+  await audioContext.audioWorklet.addModule(chrome.runtime.getURL("audio-worklet.js"));
+  workletNode = new AudioWorkletNode(audioContext, "pcm16k-downsampler");
+  sourceNode.connect(workletNode);
+  // 接到 destination 以确保该节点被音频图拉动而持续 process(输出为静音)。
+  workletNode.connect(audioContext.destination);
+
+  workletNode.port.onmessage = (e) => {
+    // e.data 是一段 16kHz/16bit/单声道 PCM 的 ArrayBuffer。
+    if (wsConnected()) {
+      ws.send(e.data);
+    }
+    // 未连接时直接丢弃,避免积压、保持低延迟。
+  };
+
+  console.info("[offscreen] 采集已开始", { contextRate: audioContext.sampleRate });
 }
 
 function stop() {
+  running = false;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
   if (workletNode) {
+    workletNode.port.onmessage = null;
     workletNode.disconnect();
     workletNode = null;
+  }
+  if (sourceNode) {
+    sourceNode.disconnect();
+    sourceNode = null;
   }
   if (mediaStream) {
     mediaStream.getTracks().forEach((t) => t.stop());
@@ -81,8 +152,9 @@ function stop() {
   }
   if (ws) {
     try {
-      ws.send(JSON.stringify({ type: "stop" }));
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "stop" }));
     } catch {}
+    ws.onclose = null; // 主动停止,不再触发重连。
     ws.close();
     ws = null;
   }

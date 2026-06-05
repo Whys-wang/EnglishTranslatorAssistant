@@ -120,9 +120,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			audioFrames++
 			audioBytes += len(data)
 			if audioFrames%50 == 0 { // 节流日志,约每 5 秒打印一次
+				// 按 16kHz/16bit/单声道估算已接收音频时长,便于核对采样率是否正确。
+				seconds := float64(audioBytes) / float64(config.AudioSampleRate*(config.AudioBitDepth/8)*config.AudioChannels)
 				log.Debug("audio received",
 					slog.Int("frames", audioFrames),
 					slog.Int("bytes", audioBytes),
+					slog.Float64("approx_seconds", seconds),
 				)
 			}
 			// TODO(里程碑 3): 转发 PCM 到 ASR 上游连接。
