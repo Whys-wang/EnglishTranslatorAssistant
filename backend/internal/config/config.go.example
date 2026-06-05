@@ -1,9 +1,14 @@
 // Package config 集中存放本项目的全部配置。
 //
-// 按照需求,所有密钥与可调参数都以「常量 / 包级变量」的形式写死在本文件中,
-// 不读取环境变量,也不读取 .env 文件。需要换 Key 时,直接修改本文件即可。
+// 【使用方法】本文件是模板。请复制为同目录下的 config.go 再填入真实密钥:
 //
-// 安全提示:本文件包含明文密钥,请勿将真实密钥推送到公共仓库。
+//	cp config.go.example config.go      # Windows: copy config.go.example config.go
+//
+// config.go 已被 .gitignore 忽略,不会进入版本库,以免明文密钥泄露到公开仓库。
+// 按需求,所有密钥与可调参数都以「常量 / 包级变量」的形式写死在 config.go 中,
+// 不读取环境变量,也不读取 .env 文件。
+//
+// 注意:本模板文件名以 .example 结尾,Go 编译器会忽略它,因此不会与 config.go 冲突。
 package config
 
 import "time"
@@ -39,12 +44,12 @@ const (
 
 // ASRRequestConfig 控制 ASR 识别行为(写死的默认值,详见火山文档)。
 type ASRRequestConfig struct {
-	EnableITN       bool   // 文本规范化(如「一九七零年」->「1970年」)
-	EnablePunc      bool   // 标点
-	EnableDDC       bool   // 语义顺滑(去口头语/重复)
-	ShowUtterances  bool   // 输出分句信息(text/start_time/end_time/definite)
-	ResultType      string // "full"=全量返回;"single"=增量返回
-	EndWindowSize   int    // 强制判停时间(ms),静音超过即定稿;0 表示不显式设置
+	EnableITN      bool   // 文本规范化(如「一九七零年」->「1970年」)
+	EnablePunc     bool   // 标点
+	EnableDDC      bool   // 语义顺滑(去口头语/重复)
+	ShowUtterances bool   // 输出分句信息(text/start_time/end_time/definite)
+	ResultType     string // "full"=全量返回;"single"=增量返回
+	EndWindowSize  int    // 强制判停时间(ms),静音超过即定稿;0 表示不显式设置
 }
 
 // ASRRequest 当前生效的 ASR 识别参数。

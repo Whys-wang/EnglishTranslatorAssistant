@@ -5,6 +5,9 @@
 *.out
 /backend/bin/
 
+# 含明文密钥的本地配置(从 config.go.example 复制而来,不进版本库)
+/backend/internal/config/config.go
+
 # 日志 / 临时
 *.log
 goversion.txt
