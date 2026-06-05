@@ -258,6 +258,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: true });
       return true;
     }
+    // 桌宠下拉切换语言:把新方向中继到 offscreen,offscreen 会经 WS 通知后端
+    // (后端 server.go 的 "config" 消息会更新 session 的目标/源语言,翻译进行中也能立即生效)。
+    if (msg.type === "config") {
+      chrome.runtime.sendMessage({
+        target: "offscreen",
+        type: "config",
+        sourceLang: msg.sourceLang || "",
+        targetLang: msg.targetLang || "",
+      });
+      sendResponse({ ok: true });
+      return true;
+    }
   }
 
   // 来自 offscreen 的字幕事件 -> 转发给页面 overlay

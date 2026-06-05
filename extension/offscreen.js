@@ -242,5 +242,21 @@ chrome.runtime.onMessage.addListener((msg) => {
     start(msg.streamId).catch((err) => console.error("[offscreen] start failed", err));
   } else if (msg.type === "stop") {
     stop();
+  } else if (msg.type === "config") {
+    // 翻译进行中切换源/目标语言:更新本地记忆(供 WS 重连后沿用),
+    // 并立即通过 WS 通知后端 session 热更新。
+    if (typeof msg.sourceLang === "string") cfgSourceLang = msg.sourceLang;
+    if (msg.targetLang) cfgTargetLang = msg.targetLang;
+    if (wsConnected()) {
+      try {
+        ws.send(
+          JSON.stringify({
+            type: "config",
+            sourceLang: cfgSourceLang,
+            targetLang: cfgTargetLang,
+          })
+        );
+      } catch {}
+    }
   }
 });

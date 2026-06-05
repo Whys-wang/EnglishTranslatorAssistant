@@ -80,7 +80,10 @@
       correctedAt: prev?.correctedAt ?? 0,
       translatedAt: prev?.translatedAt ?? 0,
     };
-    if (!next.target && prev && prev.source === next.source && prev.target) {
+    // 同一 segment(同句)在「说话中」会不断收到更新:有的只带原文(target 空),
+    // 有的带预览译文。只要还没有新译文,就保留上一次的译文继续显示,避免边说边译时
+    // 译文一闪一闪地消失。
+    if (!next.target && prev && prev.target) {
       next.target = prev.target;
     }
     // 记录译文出现/变化的时间,作为「自动消失」计时起点。
@@ -114,10 +117,10 @@
   }
 
   function visibleSegments() {
-    // 只显示目标语言字幕:仅保留已定稿(会触发翻译)的分句,
-    // 过滤掉还在说话中的 partial(此时没有译文,显示出来只会是空框)。
+    // 显示目标语言字幕:已定稿(final)的分句,以及「说话中且已有预览译文」的 partial
+    // (边说边译)。仍过滤掉还没有译文的 partial(显示出来只会是空框)。
     const all = [...segments.values()]
-      .filter((s) => s.status === "final")
+      .filter((s) => s.status === "final" || (s.status === "partial" && s.target))
       .sort((a, b) => a.start_time - b.start_time || a.segment_id.localeCompare(b.segment_id));
     return all.slice(-MAX_LINES);
   }
@@ -238,11 +241,25 @@
         if (r?.targetLang) tgtSel.value = r.targetLang;
       });
     } catch {}
+    // 任一下拉变更:存储 + 通知 background 热切换。这样翻译进行中改语言也能立刻生效,
+    // 不用「先停再开」。后端 server.go 已支持 type:"config" 的语言热切换。
+    function pushLangConfig() {
+      try {
+        chrome.runtime.sendMessage({
+          target: "background",
+          type: "config",
+          sourceLang: srcSel.value,
+          targetLang: tgtSel.value,
+        });
+      } catch {}
+    }
     srcSel.addEventListener("change", () => {
       try { chrome.storage?.local?.set({ sourceLang: srcSel.value }); } catch {}
+      pushLangConfig();
     });
     tgtSel.addEventListener("change", () => {
       try { chrome.storage?.local?.set({ targetLang: tgtSel.value }); } catch {}
+      pushLangConfig();
     });
     // 防止下拉/按钮交互被拖动逻辑吞掉。
     pet.querySelector(".si-pet-panel").addEventListener("pointerdown", (e) => e.stopPropagation());

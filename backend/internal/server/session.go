@@ -63,6 +63,17 @@ type session struct {
 	order         []string          // segment id 按首次出现顺序
 	lastReviewKey string            // 上次周期性复审的窗口指纹,内容未变则跳过,省调用
 	lastTTS       map[string]string // 每个 segment 上次已合成的译文,避免重复合成
+
+	// 边说边译:对说话中(partial)的句子做节流翻译的状态。
+	partMu    sync.Mutex
+	partState map[string]*partialState
+}
+
+// partialState 记录某句「说话中」的实时翻译节流状态。
+type partialState struct {
+	lastSource string    // 上次送去翻译的原文(用于判断增量)
+	lastAt     time.Time // 上次送去翻译的时间(用于限频)
+	inflight   bool      // 是否已有一次 partial 翻译在途(同句串行,天然限流)
 }
 
 // ttsJob 是一条待合成的译文任务。
@@ -89,6 +100,7 @@ func newSession(parent context.Context, id string, log *slog.Logger, conn *webso
 		lastSent:   make(map[string]string),
 		segments:   make(map[string]*segState),
 		lastTTS:    make(map[string]string),
+		partState:  make(map[string]*partialState),
 		tgtLang:    config.TargetLanguage, // 默认目标语言,前端可覆盖
 	}
 	s.asr = asr.NewClient(id, log, asr.Handlers{
@@ -203,9 +215,15 @@ func (s *session) onASREvent(ev asr.Event) {
 			"end_time":   u.EndTime,
 		})
 
-		// 仅对定稿(final)分句触发翻译,降低调用量与抖动。
-		if u.Definite && s.trEnabled {
-			s.enqueueTranslate(segID, u.Text, u.StartTime, u.EndTime)
+		if s.trEnabled {
+			if u.Definite {
+				// 定稿句子:走正式翻译(带上下文 + 纠错 + TTS)。
+				s.enqueueTranslate(segID, u.Text, u.StartTime, u.EndTime)
+			} else if config.Translate.PartialPreview {
+				// 边说边译:对说话中的句子做节流翻译,实时顶出预览译文,
+				// 句子定稿后再被正式译文原地覆盖。
+				s.maybeTranslatePartial(segID, u.Text, u.StartTime, u.EndTime)
+			}
 		}
 	}
 }
@@ -238,11 +256,90 @@ func (s *session) enqueueTranslate(segID, source string, start, end int) {
 	}
 	s.segMu.Unlock()
 
+	// 该句已定稿,后续不再需要 partial 预览状态。
+	s.partMu.Lock()
+	delete(s.partState, segID)
+	s.partMu.Unlock()
+
 	select {
 	case s.trQueue <- segID:
 	default:
 		s.log.Warn("translate queue full, drop", slog.String("seg", segID))
 	}
+}
+
+// maybeTranslatePartial 边说边译:对「说话中」的句子做节流翻译。
+// 节流策略:同句已有翻译在途则跳过;原文增量不足 PartialMinChars 则跳过;
+// 距上次送译不足 PartialMinInterval 则跳过。满足条件才异步翻译一次。
+func (s *session) maybeTranslatePartial(segID, source string, start, end int) {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return
+	}
+	cfg := config.Translate
+
+	s.partMu.Lock()
+	ps := s.partState[segID]
+	if ps == nil {
+		ps = &partialState{}
+		s.partState[segID] = ps
+	}
+	now := time.Now()
+	grown := len([]rune(source)) - len([]rune(ps.lastSource))
+	first := ps.lastSource == ""
+	if ps.inflight ||
+		(!first && now.Sub(ps.lastAt) < cfg.PartialMinInterval) ||
+		(!first && grown < cfg.PartialMinChars) {
+		s.partMu.Unlock()
+		return
+	}
+	ps.inflight = true
+	ps.lastSource = source
+	ps.lastAt = now
+	s.partMu.Unlock()
+
+	go s.translatePartial(segID, source, start, end)
+}
+
+// translatePartial 异步翻译一段「说话中」的原文并作为 partial 预览下发。
+// 不带上下文(更快、更省),不进纠错/TTS;若该句此时已定稿则丢弃过期预览。
+func (s *session) translatePartial(segID, source string, start, end int) {
+	defer func() {
+		s.partMu.Lock()
+		if ps := s.partState[segID]; ps != nil {
+			ps.inflight = false
+		}
+		s.partMu.Unlock()
+	}()
+
+	srcLang, tgtLang := s.languages()
+	target, err := s.tr.Translate(s.ctx, source, nil, tgtLang, srcLang)
+	if err != nil {
+		s.log.Debug("partial translate failed", slog.String("seg", segID), slog.String("err", err.Error()))
+		return
+	}
+	if strings.TrimSpace(target) == "" {
+		return
+	}
+
+	// 期间该句若已定稿并产生正式译文,丢弃这次过期的 partial 预览,避免回退覆盖。
+	s.segMu.Lock()
+	st := s.segments[segID]
+	finalized := st != nil && st.translated
+	s.segMu.Unlock()
+	if finalized {
+		return
+	}
+
+	s.writeJSON(map[string]any{
+		"type":       "subtitle",
+		"segment_id": segID,
+		"source":     source,
+		"target":     target,
+		"status":     "partial",
+		"start_time": start,
+		"end_time":   end,
+	})
 }
 
 // translateLoop 串行消费翻译队列,保证上下文顺序一致、避免并发打爆接口。

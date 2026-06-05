@@ -11,7 +11,7 @@ func TestWriteDomainAndGlossary_Empty(t *testing.T) {
 	defer restorePrompt(config.Prompt)
 	config.Prompt = config.PromptConfig{Domain: "", Glossary: map[string]string{}}
 
-	p := buildSystemPrompt(nil, "", "")
+	p := buildSystemPrompt("", "")
 	if strings.Contains(p, "领域背景") || strings.Contains(p, "术语对照表") {
 		t.Fatalf("空配置不应注入领域/术语段:\n%s", p)
 	}
@@ -28,7 +28,7 @@ func TestWriteDomainAndGlossary_DomainAndSortedGlossary(t *testing.T) {
 		},
 	}
 
-	for _, p := range []string{buildSystemPrompt(nil, "", ""), buildReviewSystemPrompt(2, "")} {
+	for _, p := range []string{buildSystemPrompt("", ""), buildReviewSystemPrompt(2, "")} {
 		if !strings.Contains(p, "领域背景") || !strings.Contains(p, "一场关于机器学习的技术分享") {
 			t.Fatalf("缺少领域背景:\n%s", p)
 		}

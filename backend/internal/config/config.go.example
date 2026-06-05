@@ -161,14 +161,28 @@ type TranslateConfig struct {
 
 	// MaxTokens 译文最大长度;0 表示不显式限制。
 	MaxTokens int
+
+	// PartialPreview 开启「边说边译」:对说话中(partial)的句子也实时翻译,
+	// 句子定稿后再用带上下文的正式译文原地覆盖。关闭则只翻译定稿句子。
+	PartialPreview bool
+
+	// PartialMinChars 触发一次 partial 重译所需的最小原文增量(按字符/rune 计):
+	// 原文相比上次送译至少多出这么多字才再次翻译,避免逐字刷接口。
+	PartialMinChars int
+
+	// PartialMinInterval 同一句两次 partial 翻译之间的最小时间间隔。
+	PartialMinInterval time.Duration
 }
 
 // Translate 当前生效的翻译配置(写死的默认值)。
 var Translate = TranslateConfig{
-	ContextWindow: 3,   // 上下文从 5 降到 3:更短的提示词 -> 更快返回译文(略微牺牲长距一致性)
-	Timeout:       20 * time.Second,
-	Temperature:   0.3,
-	MaxTokens:     256, // 单句译文足够;上限收紧让生成更快收尾
+	ContextWindow:      3, // 上下文从 5 降到 3:更短的提示词 -> 更快返回译文(略微牺牲长距一致性)
+	Timeout:            20 * time.Second,
+	Temperature:        0.3,
+	MaxTokens:          256, // 单句译文足够;上限收紧让生成更快收尾
+	PartialPreview:     true,
+	PartialMinChars:    4,
+	PartialMinInterval: 350 * time.Millisecond,
 }
 
 // ───────────────────────────────────────────────────────────────────────────

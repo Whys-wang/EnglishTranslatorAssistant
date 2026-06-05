@@ -116,51 +116,57 @@ func resolveTarget(target string) string {
 }
 
 // buildSystemPrompt 组装系统提示词,翻译目标语言为 target;source 为源语言提示
-// (留空表示自动识别,不附加)。可选附带上下文。
-func buildSystemPrompt(history []Pair, target, source string) string {
+// (留空表示自动识别,不附加)。上下文以多轮对话(user/assistant)的形式单独喂给模型,
+// 不再混入 system prompt——这样模型几乎不会把上一轮译文复述/拼接到当前译文里。
+func buildSystemPrompt(target, source string) string {
 	target = resolveTarget(target)
 	var sb strings.Builder
 	sb.WriteString("你是专业的实时同声传译引擎。请把【待翻译原文】翻译成")
 	sb.WriteString(target)
-	sb.WriteString("。要求:\n")
-	sb.WriteString("1. 只输出译文本身,不要输出原文、引号、解释或任何多余内容;\n")
-	sb.WriteString("2. 译文要自然流畅、符合")
+	sb.WriteString("。严格要求:\n")
+	sb.WriteString("1. 每轮只输出「最后一条 user 消息」中【待翻译原文】对应的译文本身,不要输出原文、引号、解释、序号或任何多余内容;\n")
+	sb.WriteString("2. 严禁把前几轮(历史对话)中的原文或译文复述、拼接到当前译文里;前几轮仅用于让你保持术语、人名与语气一致;\n")
+	sb.WriteString("3. 译文要自然流畅、符合")
 	sb.WriteString(target)
 	sb.WriteString("的口语表达习惯;\n")
-	sb.WriteString("3. 即使原文是一句话的片段也请给出通顺的部分译文,不要补全臆测的内容。\n")
+	sb.WriteString("4. 即使原文是一句话的片段也请给出通顺的部分译文,不要补全臆测的内容。\n")
 	if s := strings.TrimSpace(source); s != "" {
-		sb.WriteString("4. 原文语言为")
+		sb.WriteString("5. 原文语言为")
 		sb.WriteString(s)
 		sb.WriteString(",请据此正确理解原文。\n")
 	}
 	writeDomainAndGlossary(&sb)
-	if len(history) > 0 {
-		sb.WriteString("\n以下是最近的上下文(原文 => 译文),仅供你保持术语、人名与语气一致,切勿翻译或复述它们:\n")
-		for _, p := range history {
-			sb.WriteString("- ")
-			sb.WriteString(p.Source)
-			sb.WriteString(" => ")
-			sb.WriteString(p.Target)
-			sb.WriteString("\n")
-		}
-	}
 	return sb.String()
 }
 
 // Translate 把 source 翻译成 target(为空回退默认);history 为可选上下文,
 // sourceLang 为可选源语言提示(留空表示自动识别)。
+//
+// 上下文不是塞进 system prompt 拼成「原文 => 译文」表,而是作为标准多轮对话发送:
+// 每段历史 = 一条 user(原文) + 一条 assistant(译文),当前句作为最后一条 user。
+// LLM 训练时见得最多的就是这种格式,生成边界很清晰,显著降低「上一句译文渗漏到本句」。
 func (c *Client) Translate(ctx context.Context, source string, history []Pair, target, sourceLang string) (string, error) {
 	source = strings.TrimSpace(source)
 	if source == "" {
 		return "", nil
 	}
 
+	messages := make([]chatMessage, 0, 2+2*len(history))
+	messages = append(messages, chatMessage{Role: "system", Content: buildSystemPrompt(target, sourceLang)})
+	for _, p := range history {
+		if strings.TrimSpace(p.Source) == "" || strings.TrimSpace(p.Target) == "" {
+			continue
+		}
+		messages = append(messages,
+			chatMessage{Role: "user", Content: "【待翻译原文】\n" + p.Source},
+			chatMessage{Role: "assistant", Content: p.Target},
+		)
+	}
+	messages = append(messages, chatMessage{Role: "user", Content: "【待翻译原文】\n" + source})
+
 	reqBody := chatRequest{
-		Model: config.ArkModel,
-		Messages: []chatMessage{
-			{Role: "system", Content: buildSystemPrompt(history, target, sourceLang)},
-			{Role: "user", Content: "【待翻译原文】\n" + source},
-		},
+		Model:       config.ArkModel,
+		Messages:    messages,
 		Temperature: config.Translate.Temperature,
 		MaxTokens:   config.Translate.MaxTokens,
 		Stream:      false,
