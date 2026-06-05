@@ -56,14 +56,19 @@ type sessionPayload struct {
 }
 
 // Synthesize 把一段文本合成为音频字节(整段返回),format 见 config.TTS.Format。
-// 流程:StartConnection -> StartSession -> TaskRequest(text) -> FinishSession -> 收音频 -> SessionFinished。
 func (c *Client) Synthesize(ctx context.Context, text string) ([]byte, string, error) {
+	if !Configured() {
+		return nil, "", fmt.Errorf("tts 未启用或音色未配置")
+	}
+	return c.synthesizeWith(ctx, text, config.TTSVoiceType)
+}
+
+// synthesizeWith 用指定音色完成一次合成(供 Synthesize 与联机测试复用,不做 Configured 校验)。
+// 流程:StartConnection -> StartSession -> TaskRequest(text) -> FinishSession -> 收音频 -> SessionFinished。
+func (c *Client) synthesizeWith(ctx context.Context, text, voice string) ([]byte, string, error) {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return nil, "", nil
-	}
-	if !Configured() {
-		return nil, "", fmt.Errorf("tts 未启用或音色未配置")
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, config.TTS.Timeout)
@@ -112,7 +117,7 @@ func (c *Client) Synthesize(ctx context.Context, text string) ([]byte, string, e
 		Event:     EventStartSession,
 		Namespace: config.TTSNamespace,
 		ReqParams: reqParams{
-			Speaker:     config.TTSVoiceType,
+			Speaker:     voice,
 			AudioParams: &audioParams{Format: config.TTS.Format, SampleRate: config.TTS.SampleRate},
 		},
 	})
