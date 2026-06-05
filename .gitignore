@@ -1,0 +1,15 @@
+# Go
+/backend/backend
+/backend/backend.exe
+*.exe
+*.out
+/backend/bin/
+
+# 日志 / 临时
+*.log
+goversion.txt
+
+# 编辑器 / 系统
+.DS_Store
+.idea/
+.vscode/

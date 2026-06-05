@@ -1,0 +1,49 @@
+/* overlay.css —— 双语字幕 overlay 样式 */
+
+#__simul_interpreter_overlay__ {
+  position: fixed;
+  left: 50%;
+  bottom: 6%;
+  transform: translateX(-50%);
+  z-index: 2147483647;
+  max-width: 80vw;
+  pointer-events: none;
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+
+#__simul_interpreter_overlay__ .si-subtitle-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+#__simul_interpreter_overlay__ .si-seg {
+  background: rgba(0, 0, 0, 0.72);
+  color: #fff;
+  padding: 8px 14px;
+  border-radius: 8px;
+  line-height: 1.4;
+  text-align: center;
+}
+
+#__simul_interpreter_overlay__ .si-source {
+  font-size: 14px;
+  opacity: 0.7;
+}
+
+#__simul_interpreter_overlay__ .si-target {
+  font-size: 20px;
+  font-weight: 600;
+}
+
+/* partial(中间结果)灰显、斜体 */
+#__simul_interpreter_overlay__ .si-partial .si-target {
+  color: #b0b0b0;
+  font-style: italic;
+  font-weight: 400;
+}
+
+/* 被纠错修订的段做高亮提示(里程碑 6) */
+#__simul_interpreter_overlay__ .si-corrected {
+  outline: 2px solid #ffd54f;
+}
