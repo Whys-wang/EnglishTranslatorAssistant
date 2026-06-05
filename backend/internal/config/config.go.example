@@ -59,7 +59,7 @@ var ASRRequest = ASRRequestConfig{
 	EnableDDC:      false,
 	ShowUtterances: true,
 	ResultType:     "full",
-	EndWindowSize:  800,
+	EndWindowSize:  400, // 静音 400ms 即判停定稿:更快跟上语速、尽早出译文(过低会切碎句子)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -165,10 +165,10 @@ type TranslateConfig struct {
 
 // Translate 当前生效的翻译配置(写死的默认值)。
 var Translate = TranslateConfig{
-	ContextWindow: 5,
+	ContextWindow: 3,   // 上下文从 5 降到 3:更短的提示词 -> 更快返回译文(略微牺牲长距一致性)
 	Timeout:       20 * time.Second,
 	Temperature:   0.3,
-	MaxTokens:     512,
+	MaxTokens:     256, // 单句译文足够;上限收紧让生成更快收尾
 }
 
 // ───────────────────────────────────────────────────────────────────────────

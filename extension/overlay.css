@@ -36,9 +36,9 @@
   text-align: center;
 }
 
+/* 仅显示目标语言字幕:隐藏原文行 */
 #__simul_interpreter_overlay__ .si-source {
-  font-size: 14px;
-  opacity: 0.7;
+  display: none;
 }
 
 #__simul_interpreter_overlay__ .si-target {

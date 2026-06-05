@@ -150,12 +150,20 @@ async function injectPetIntoOpenTabs() {
 }
 chrome.runtime.onInstalled.addListener(injectPetIntoOpenTabs);
 chrome.runtime.onStartup.addListener(injectPetIntoOpenTabs);
+// Service Worker 一启动(含手动「重新加载」扩展)就补注入一次:
+// 比只依赖 onInstalled 更可靠,确保已打开的旧标签页也立刻出现桌宠。
+console.log("[SI] background v0.2.0 启动,向已打开标签页注入桌宠");
+injectPetIntoOpenTabs();
 
 // 打开浏览器的扩展快捷键设置页(Edge / Chrome 路径不同)。
 function openShortcutsPage() {
   const isEdge = navigator.userAgent.includes("Edg");
   const url = isEdge ? "edge://extensions/shortcuts" : "chrome://extensions/shortcuts";
-  chrome.tabs.create({ url }).catch(() => {});
+  console.log("[SI] 打开快捷键设置页:", url);
+  chrome.tabs.create({ url }).then(
+    () => console.log("[SI] 快捷键设置页已打开"),
+    (e) => console.error("[SI] 打开快捷键设置页失败,请手动访问", url, e)
+  );
 }
 
 // 读取「toggle-translation」当前实际绑定的快捷键(用户可能改过)。

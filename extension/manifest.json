@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI 同声传译助手(火山引擎版)",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "实时把标签页中的外语音频翻译为中文双语字幕(可选 TTS),具备自动纠错能力。",
   "permissions": [
     "tabCapture",

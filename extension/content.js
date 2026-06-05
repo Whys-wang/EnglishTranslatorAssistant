@@ -16,7 +16,8 @@
 
   const OVERLAY_ID = "__simul_interpreter_overlay__";
   const PET_ID = "__simul_interpreter_pet__";
-  const MAX_LINES = 4;
+  const MAX_LINES = 1; // 只显示最新一句译文,说完一句下一句顶上,不堆积占空间
+  const AUTOHIDE_MS = 4000; // 译文出现后若 4s 内没有新句,自动消失(不再占屏)
   const CORRECTED_HIGHLIGHT_MS = 4000;
 
   // 当前「开始/停止」快捷键(由 background 查询 chrome.commands 回填;用户可改)。
@@ -46,6 +47,7 @@
 
   // ── 字幕 overlay ────────────────────────────────────────────────────
   const segments = new Map();
+  const dismissed = new Set(); // 已自动消失的 segment id,避免被复审更新重新唤出
 
   function ensureOverlay() {
     let el = document.getElementById(OVERLAY_ID);
@@ -61,9 +63,11 @@
     const el = document.getElementById(OVERLAY_ID);
     if (el) el.remove();
     segments.clear();
+    dismissed.clear();
   }
 
   function upsertSegment(msg) {
+    if (dismissed.has(msg.segment_id)) return; // 已自动消失的句子不再唤回
     const prev = segments.get(msg.segment_id);
     const next = {
       segment_id: msg.segment_id,
@@ -74,13 +78,33 @@
       end_time: msg.end_time ?? prev?.end_time ?? 0,
       error: "",
       correctedAt: prev?.correctedAt ?? 0,
+      translatedAt: prev?.translatedAt ?? 0,
     };
     if (!next.target && prev && prev.source === next.source && prev.target) {
       next.target = prev.target;
     }
+    // 记录译文出现/变化的时间,作为「自动消失」计时起点。
+    if (next.target && next.target !== prev?.target) {
+      next.translatedAt = Date.now();
+    }
     if (msg.corrected) next.correctedAt = Date.now();
     segments.set(next.segment_id, next);
   }
+
+  // 周期性清除「已出现 AUTOHIDE_MS 仍无新句顶替」的旧译文,让屏幕保持清爽。
+  function sweepExpired() {
+    const now = Date.now();
+    let changed = false;
+    for (const [id, s] of segments) {
+      if (s.status === "final" && s.target && s.translatedAt && now - s.translatedAt > AUTOHIDE_MS) {
+        segments.delete(id);
+        dismissed.add(id);
+        changed = true;
+      }
+    }
+    if (changed) render();
+  }
+  setInterval(sweepExpired, 1000);
 
   function markError(segmentId, message) {
     const seg = segments.get(segmentId);
@@ -90,9 +114,11 @@
   }
 
   function visibleSegments() {
-    const all = [...segments.values()].sort(
-      (a, b) => a.start_time - b.start_time || a.segment_id.localeCompare(b.segment_id)
-    );
+    // 只显示目标语言字幕:仅保留已定稿(会触发翻译)的分句,
+    // 过滤掉还在说话中的 partial(此时没有译文,显示出来只会是空框)。
+    const all = [...segments.values()]
+      .filter((s) => s.status === "final")
+      .sort((a, b) => a.start_time - b.start_time || a.segment_id.localeCompare(b.segment_id));
     return all.slice(-MAX_LINES);
   }
 
