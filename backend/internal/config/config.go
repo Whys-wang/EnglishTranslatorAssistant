@@ -23,7 +23,30 @@ const (
 
 	// ASRWebSocketURL 是大模型流式 ASR 的 WebSocket 接入地址。
 	ASRWebSocketURL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
+
+	// ASRModelName 模型名称,目前固定为 bigmodel。
+	ASRModelName = "bigmodel"
 )
+
+// ASRRequestConfig 控制 ASR 识别行为(写死的默认值,详见火山文档)。
+type ASRRequestConfig struct {
+	EnableITN       bool   // 文本规范化(如「一九七零年」->「1970年」)
+	EnablePunc      bool   // 标点
+	EnableDDC       bool   // 语义顺滑(去口头语/重复)
+	ShowUtterances  bool   // 输出分句信息(text/start_time/end_time/definite)
+	ResultType      string // "full"=全量返回;"single"=增量返回
+	EndWindowSize   int    // 强制判停时间(ms),静音超过即定稿;0 表示不显式设置
+}
+
+// ASRRequest 当前生效的 ASR 识别参数。
+var ASRRequest = ASRRequestConfig{
+	EnableITN:      true,
+	EnablePunc:     true,
+	EnableDDC:      false,
+	ShowUtterances: true,
+	ResultType:     "full",
+	EndWindowSize:  800,
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // TTS —— 火山引擎「大模型语音合成 双向流式 V3」

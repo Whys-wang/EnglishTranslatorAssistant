@@ -2,7 +2,7 @@
 
 把单向外语音频流实时翻译成**中文双语字幕**(可选 TTS 语音)的助手。核心难点是**低延迟**与**自动纠正此前的识别/翻译错误**。
 
-> 当前进度:里程碑 2 —— 前端音频采集与分片(tabCapture → 16k PCM → WebSocket)。
+> 当前进度:里程碑 3 —— 接入火山 ASR 大模型流式(后端中继,partial/final)。
 
 ## 架构
 
@@ -90,7 +90,7 @@ curl http://localhost:8765/healthz
 
 1. [x] chore: 项目脚手架(前后端目录、写死配置、README 骨架)
 2. [x] feat: 前端音频采集与分片(tabCapture→16k PCM→WebSocket)
-3. [ ] feat: 接入火山 ASR 流式(二进制协议解析,partial/final)
+3. [x] feat: 接入火山 ASR 流式(二进制协议解析,partial/final)
 4. [ ] feat: 接入方舟翻译(分句、上下文窗口、回填 segment)
 5. [ ] feat: 双语字幕 UI(partial 灰显、final 定稿、原地更新)
 6. [ ] feat: 纠错能力(ASR 修订重译 + 周期性 LLM 复审)
