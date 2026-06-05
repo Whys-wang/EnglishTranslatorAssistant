@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 	"simul-interpreter/internal/asr"
 	"simul-interpreter/internal/config"
 	"simul-interpreter/internal/translate"
+	"simul-interpreter/internal/tts"
 )
 
 // segState 保存一个 segment 的最新状态,用于翻译上下文与回填。
@@ -41,6 +43,10 @@ type session struct {
 	trQueue   chan string // 待翻译的 segment id
 	trEnabled bool        // Ark 是否已配置(未配置则跳过翻译)
 
+	tts        *tts.Client
+	ttsQueue   chan ttsJob // 待合成的译文
+	ttsEnabled bool        // TTS 是否启用且音色已配置
+
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -48,23 +54,34 @@ type session struct {
 	segMu         sync.Mutex
 	lastSent      map[string]string
 	segments      map[string]*segState
-	order         []string // segment id 按首次出现顺序
-	lastReviewKey string   // 上次周期性复审的窗口指纹,内容未变则跳过,省调用
+	order         []string          // segment id 按首次出现顺序
+	lastReviewKey string            // 上次周期性复审的窗口指纹,内容未变则跳过,省调用
+	lastTTS       map[string]string // 每个 segment 上次已合成的译文,避免重复合成
+}
+
+// ttsJob 是一条待合成的译文任务。
+type ttsJob struct {
+	segID string
+	text  string
 }
 
 func newSession(parent context.Context, id string, log *slog.Logger, conn *websocket.Conn) *session {
 	ctx, cancel := context.WithCancel(parent)
 	s := &session{
-		id:        id,
-		log:       log,
-		conn:      conn,
-		ctx:       ctx,
-		cancel:    cancel,
-		tr:        translate.NewClient(log),
-		trQueue:   make(chan string, 64),
-		trEnabled: translate.Configured(),
-		lastSent:  make(map[string]string),
-		segments:  make(map[string]*segState),
+		id:         id,
+		log:        log,
+		conn:       conn,
+		ctx:        ctx,
+		cancel:     cancel,
+		tr:         translate.NewClient(log),
+		trQueue:    make(chan string, 64),
+		trEnabled:  translate.Configured(),
+		tts:        tts.NewClient(log),
+		ttsQueue:   make(chan ttsJob, 64),
+		ttsEnabled: tts.Configured(),
+		lastSent:   make(map[string]string),
+		segments:   make(map[string]*segState),
+		lastTTS:    make(map[string]string),
 	}
 	s.asr = asr.NewClient(id, log, asr.Handlers{
 		OnEvent: s.onASREvent,
@@ -84,6 +101,12 @@ func (s *session) start() {
 		// 纠错第二层:周期性 LLM 复审(用后文校正前文)。
 		if config.Correction.EnablePeriodicReview {
 			go s.reviewLoop()
+		}
+		// 里程碑 7:译文转语音(可开关,默认关闭/需配置音色)。
+		if s.ttsEnabled {
+			go s.ttsLoop()
+		} else if config.TTS.Enable {
+			s.log.Warn("tts disabled: 已开启 TTS.Enable 但 TTSVoiceType 仍是占位符,跳过语音合成")
 		}
 	} else {
 		s.log.Warn("translation disabled: Ark 未配置(ArkAPIKey/ArkModel 仍是占位符),仅输出原文字幕")
@@ -268,6 +291,60 @@ func (s *session) translateSegment(segID string) {
 		"corrected":  corrected,
 	})
 	s.log.Debug("translation backfilled", slog.String("seg", segID), slog.Bool("corrected", corrected))
+
+	s.enqueueTTS(segID, target)
+}
+
+// enqueueTTS 把一段译文加入语音合成队列(非阻塞,去重)。
+func (s *session) enqueueTTS(segID, text string) {
+	if !s.ttsEnabled || strings.TrimSpace(text) == "" {
+		return
+	}
+	s.segMu.Lock()
+	if s.lastTTS[segID] == text {
+		s.segMu.Unlock()
+		return // 同一 segment 的同一译文已合成过,跳过
+	}
+	s.lastTTS[segID] = text
+	s.segMu.Unlock()
+
+	select {
+	case s.ttsQueue <- ttsJob{segID: segID, text: text}:
+	default:
+		s.log.Warn("tts queue full, drop", slog.String("seg", segID))
+	}
+}
+
+// ttsLoop 串行消费合成队列(避免并发打爆接口,也让音频顺序与字幕一致)。
+func (s *session) ttsLoop() {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case job := <-s.ttsQueue:
+			s.synthesize(job)
+		}
+	}
+}
+
+// synthesize 合成一句译文并把音频(base64)下发前端播放。
+func (s *session) synthesize(job ttsJob) {
+	audio, format, err := s.tts.Synthesize(s.ctx, job.text)
+	if err != nil {
+		s.log.Warn("tts failed", slog.String("seg", job.segID), slog.String("err", err.Error()))
+		return
+	}
+	if len(audio) == 0 {
+		return
+	}
+	s.writeJSON(map[string]any{
+		"type":        "tts_audio",
+		"segment_id":  job.segID,
+		"format":      format,
+		"sample_rate": config.TTS.SampleRate,
+		"audio":       base64.StdEncoding.EncodeToString(audio),
+	})
+	s.log.Debug("tts audio sent", slog.String("seg", job.segID), slog.Int("bytes", len(audio)))
 }
 
 // reviewLoop 周期性触发 LLM 复审纠错,直到会话结束。
@@ -368,6 +445,7 @@ func (s *session) reviewRecent() {
 			"corrected":  true,
 		})
 		s.log.Debug("review corrected", slog.String("seg", id))
+		s.enqueueTTS(id, newTarget)
 	}
 }
 

@@ -57,6 +57,33 @@ function wsConnected() {
   return ws && ws.readyState === WebSocket.OPEN;
 }
 
+// ── 译文语音(TTS)播放 ───────────────────────────────────────────────
+// 后端把每句译文合成的音频(base64)经 WS 下发;这里顺序排队播放,避免重叠。
+let ttsNextTime = 0; // 下一句应开始播放的 AudioContext 时间
+
+function base64ToArrayBuffer(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+
+async function playTTSAudio(b64) {
+  if (!audioContext || !b64) return;
+  try {
+    const buf = await audioContext.decodeAudioData(base64ToArrayBuffer(b64));
+    const src = audioContext.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioContext.destination);
+    const now = audioContext.currentTime;
+    const startAt = Math.max(now, ttsNextTime);
+    src.start(startAt);
+    ttsNextTime = startAt + buf.duration; // 紧接上一句,顺序播放
+  } catch (e) {
+    console.error("[offscreen] TTS 播放失败", e);
+  }
+}
+
 function scheduleReconnect() {
   if (!running) return;
   if (reconnectTimer) return;
@@ -98,6 +125,11 @@ function connectBackend() {
     } catch {
       return;
     }
+    // 译文语音:直接在 offscreen 解码播放(不必经 background/页面)。
+    if (msg.type === "tts_audio") {
+      playTTSAudio(msg.audio);
+      return;
+    }
     // 后端回传的字幕 / 翻译错误事件 -> 经常驻 Port 交给 background 转发到页面 overlay。
     // 注意:用 channel 作路由键,绝不能复用 msg.target(那是译文,展开后会覆盖路由)。
     if (msg.type === "subtitle" || msg.type === "translate_error") {
@@ -119,6 +151,7 @@ async function start(streamId) {
   if (running) stop(); // 幂等:先清理旧会话。
   running = true;
   reconnectDelay = RECONNECT.initialMs;
+  ttsNextTime = 0; // 重置译文语音播放时钟
   ensurePort(); // 建立与 SW 的常驻连接(保活 + 字幕通道)
   connectBackend();
 

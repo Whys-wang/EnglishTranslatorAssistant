@@ -63,8 +63,7 @@ var ASRRequest = ASRRequestConfig{
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// TTS —— 火山引擎「大模型语音合成 双向流式 V3」
-// (本里程碑仅占位,功能 7 再正式接入)
+// TTS —— 火山引擎「大模型语音合成 双向流式 V3」(里程碑 7,可开关)
 // ───────────────────────────────────────────────────────────────────────────
 const (
 	// TTSAppKey / TTSAccessKey 与 ASR 共用同一套鉴权。
@@ -80,7 +79,37 @@ const (
 	// TTSHost / TTSPath 双向流式合成接入信息。
 	TTSHost = "openspeech.bytedance.com"
 	TTSPath = "/api/v3/tts/bidirection"
+
+	// TTSWebSocketURL 大模型语音合成「双向流式 V3」的 WebSocket 接入地址。
+	TTSWebSocketURL = "wss://" + TTSHost + TTSPath
+
+	// TTSNamespace 双向流式命名空间,固定值。
+	TTSNamespace = "BidirectionalTTS"
 )
+
+// TTSConfig 控制「译文转语音」(里程碑 7,可开关)。
+type TTSConfig struct {
+	// Enable 总开关:关闭时完全不合成语音(默认关闭)。
+	Enable bool
+
+	// Format 音频编码:前端用 Web Audio decodeAudioData 播放,mp3 最省事。
+	Format string
+
+	// SampleRate 合成采样率(Hz)。
+	SampleRate int
+
+	// Timeout 单句合成(建连->收完音频)的整体超时。
+	Timeout time.Duration
+}
+
+// TTS 当前生效的语音合成配置(写死的默认值)。
+// 注意:Enable 默认关闭,且需先把 TTSVoiceType 填成真实音色才会真正合成。
+var TTS = TTSConfig{
+	Enable:     false,
+	Format:     "mp3",
+	SampleRate: 24000,
+	Timeout:    20 * time.Second,
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // 翻译 —— 火山方舟 Ark(OpenAI 兼容)
