@@ -172,6 +172,38 @@ var Translate = TranslateConfig{
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// 术语表 / 领域提示词(里程碑 8)
+// ───────────────────────────────────────────────────────────────────────────
+
+// PromptConfig 定制翻译与复审的「领域背景」与「术语对照」。
+// 两者都会注入到翻译 / 复审的系统提示词中,用来稳定专有名词与译法一致性。
+type PromptConfig struct {
+	// Domain 领域 / 场景背景描述(自由文本)。例如:
+	//   "一场关于机器学习与大语言模型的技术分享,讲者会频繁使用深度学习术语"。
+	// 留空表示不附加领域背景。
+	Domain string
+
+	// Glossary 术语对照表:原文词条 => 指定译法。命中时必须采用指定译法,
+	// 用于锁定人名、产品名、专业术语的统一翻译。留空表示不启用术语表。
+	Glossary map[string]string
+}
+
+// Prompt 当前生效的术语表 / 领域提示词(默认均为空,不改变既有翻译行为)。
+// 按需在此填入领域背景与术语,例如:
+//
+//	var Prompt = PromptConfig{
+//	    Domain: "一场关于机器学习的技术分享",
+//	    Glossary: map[string]string{
+//	        "transformer": "Transformer 架构",
+//	        "attention":   "注意力机制",
+//	    },
+//	}
+var Prompt = PromptConfig{
+	Domain:   "",
+	Glossary: map[string]string{},
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // 纠错策略(本项目核心,做成可配置)
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -229,7 +261,7 @@ var Reconnect = ReconnectConfig{
 // ───────────────────────────────────────────────────────────────────────────
 const (
 	AudioSampleRate = 16000 // 16kHz
-	AudioBitDepth   = 16     // 16bit
-	AudioChannels   = 1      // 单声道
-	AudioChunkMs    = 100    // 约 100ms 一片
+	AudioBitDepth   = 16    // 16bit
+	AudioChannels   = 1     // 单声道
+	AudioChunkMs    = 100   // 约 100ms 一片
 )

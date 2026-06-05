@@ -113,10 +113,13 @@ func (s *session) start() {
 	}
 }
 
-// close 结束会话,停止 ASR。
+// close 结束会话,停止 ASR 并释放复用的 TTS 连接。
 func (s *session) close() {
 	s.cancel()
 	s.asr.Close()
+	if s.tts != nil {
+		s.tts.Close()
+	}
 }
 
 // sendAudio 转发一段前端上来的 PCM 到 ASR。

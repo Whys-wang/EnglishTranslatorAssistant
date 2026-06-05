@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 
 	"log/slog"
@@ -77,6 +78,35 @@ type chatResponse struct {
 	} `json:"error"`
 }
 
+// writeDomainAndGlossary 把领域背景与术语表(若已配置)写入系统提示词。
+// 术语条目按原文词条字典序输出,保证提示词稳定、便于测试。
+func writeDomainAndGlossary(sb *strings.Builder) {
+	if d := strings.TrimSpace(config.Prompt.Domain); d != "" {
+		sb.WriteString("\n【领域背景】")
+		sb.WriteString(d)
+		sb.WriteString("\n请据此理解专有名词与语境。\n")
+	}
+	if len(config.Prompt.Glossary) > 0 {
+		keys := make([]string, 0, len(config.Prompt.Glossary))
+		for k := range config.Prompt.Glossary {
+			if strings.TrimSpace(k) != "" {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		if len(keys) > 0 {
+			sb.WriteString("\n【术语对照表】以下词条出现时必须采用指定译法(大小写/复数等变体同样适用):\n")
+			for _, k := range keys {
+				sb.WriteString("- ")
+				sb.WriteString(k)
+				sb.WriteString(" => ")
+				sb.WriteString(config.Prompt.Glossary[k])
+				sb.WriteString("\n")
+			}
+		}
+	}
+}
+
 // buildSystemPrompt 组装系统提示词,可选附带上下文。
 func buildSystemPrompt(history []Pair) string {
 	var sb strings.Builder
@@ -88,6 +118,7 @@ func buildSystemPrompt(history []Pair) string {
 	sb.WriteString(config.TargetLanguage)
 	sb.WriteString("的口语表达习惯;\n")
 	sb.WriteString("3. 即使原文是一句话的片段也请给出通顺的部分译文,不要补全臆测的内容。\n")
+	writeDomainAndGlossary(&sb)
 	if len(history) > 0 {
 		sb.WriteString("\n以下是最近的上下文(原文 => 译文),仅供你保持术语、人名与语气一致,切勿翻译或复述它们:\n")
 		for _, p := range history {
@@ -239,5 +270,6 @@ func buildReviewSystemPrompt(n int) string {
 	sb.WriteString(config.TargetLanguage)
 	sb.WriteString("口语习惯,且只对应该句原文,不要合并、拆分或臆测补全;\n")
 	sb.WriteString(fmt.Sprintf("3. 严格只输出一个 JSON 字符串数组,长度必须为 %d,按 index 顺序给出每句修订后的译文,不要输出任何额外文字、键名、序号或注释。", n))
+	writeDomainAndGlossary(&sb)
 	return sb.String()
 }
