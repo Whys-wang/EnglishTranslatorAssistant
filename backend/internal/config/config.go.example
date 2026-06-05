@@ -118,6 +118,30 @@ const (
 	TargetLanguage = "中文"
 )
 
+// TranslateConfig 控制方舟(Ark)翻译的行为。
+type TranslateConfig struct {
+	// ContextWindow 翻译时携带的上下文(最近 N 段「原文 => 译文」),
+	// 用于保持术语、人名与语气一致。
+	ContextWindow int
+
+	// Timeout 单次翻译请求的超时时间。
+	Timeout time.Duration
+
+	// Temperature 采样温度,低温更稳定、更贴近直译。
+	Temperature float64
+
+	// MaxTokens 译文最大长度;0 表示不显式限制。
+	MaxTokens int
+}
+
+// Translate 当前生效的翻译配置(写死的默认值)。
+var Translate = TranslateConfig{
+	ContextWindow: 5,
+	Timeout:       20 * time.Second,
+	Temperature:   0.3,
+	MaxTokens:     512,
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // 纠错策略(本项目核心,做成可配置)
 // ───────────────────────────────────────────────────────────────────────────
