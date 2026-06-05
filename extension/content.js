@@ -135,7 +135,8 @@
   }
 
   chrome.runtime.onMessage.addListener((msg) => {
-    if (msg?.target !== "page-subtitle") return;
+    // channel 是路由键;msg.target 留给「译文」字段,二者不可混用。
+    if (msg?.channel !== "page-subtitle") return;
     if (msg.type === "subtitle") {
       setStatus(""); // 收到第一条字幕后隐藏状态提示
       upsertSegment(msg);

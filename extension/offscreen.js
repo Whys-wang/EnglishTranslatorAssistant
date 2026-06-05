@@ -99,8 +99,9 @@ function connectBackend() {
       return;
     }
     // 后端回传的字幕 / 翻译错误事件 -> 经常驻 Port 交给 background 转发到页面 overlay。
+    // 注意:用 channel 作路由键,绝不能复用 msg.target(那是译文,展开后会覆盖路由)。
     if (msg.type === "subtitle" || msg.type === "translate_error") {
-      sendSubtitleToBackground({ target: "page-subtitle", ...msg });
+      sendSubtitleToBackground({ channel: "page-subtitle", ...msg });
     }
   };
 

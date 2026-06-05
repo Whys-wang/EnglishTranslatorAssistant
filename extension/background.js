@@ -97,7 +97,7 @@ async function stopCapture() {
   if (tabId != null) {
     // 通知页面移除字幕 overlay(含绿色状态条)。
     try {
-      await chrome.tabs.sendMessage(tabId, { target: "page-subtitle", type: "clear" });
+      await chrome.tabs.sendMessage(tabId, { channel: "page-subtitle", type: "clear" });
     } catch (e) {
       /* 标签页可能已关闭 */
     }
@@ -133,7 +133,7 @@ chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "si-subtitles") return;
   console.log("[SI] offscreen 端口已连接");
   port.onMessage.addListener((msg) => {
-    if (msg?.target === "page-subtitle") {
+    if (msg?.channel === "page-subtitle") {
       rxCount++;
       console.log("[SI] (port) 收到字幕 #" + rxCount, "type =", msg.type, "source =", msg.source);
       setBadge(String(rxCount % 1000), "#108446");
@@ -161,10 +161,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   // 来自 offscreen 的字幕事件 -> 转发给页面 overlay
-  if (msg?.target === "page-subtitle") {
+  if (msg?.channel === "page-subtitle") {
     // 同步先把角标 +1:证明「offscreen -> background」这条消息确实到达了。
     rxCount++;
-    console.log("[SI] 收到字幕消息 #" + rxCount, "type =", msg?.type, "source =", msg?.source, "target =", msg?.target);
+    console.log("[SI] 收到字幕消息 #" + rxCount, "type =", msg?.type, "source =", msg?.source);
     setBadge(String(rxCount % 1000), "#108446");
     forwardSubtitle(msg);
     return false;
