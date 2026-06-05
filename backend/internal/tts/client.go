@@ -72,6 +72,15 @@ func (c *Client) Synthesize(ctx context.Context, text string) ([]byte, string, e
 	return c.synthesizeWith(ctx, text, config.TTSVoiceType)
 }
 
+// SynthesizeWith 用指定音色合成一段文本(供按「目标语言」选音色的场景使用)。
+// voice 为空表示该目标语言没有配置音色,直接跳过(返回空音频、无错误)。
+func (c *Client) SynthesizeWith(ctx context.Context, text, voice string) ([]byte, string, error) {
+	if strings.TrimSpace(voice) == "" {
+		return nil, "", nil
+	}
+	return c.synthesizeWith(ctx, text, voice)
+}
+
 // synthesizeWith 用指定音色完成一次合成(供 Synthesize 与联机测试复用,不做 Configured 校验)。
 //
 // 复用持久连接:首次或重连后做一次连接级 StartConnection;每句仅跑会话级流程。

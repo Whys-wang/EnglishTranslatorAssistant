@@ -19,9 +19,25 @@
     "type": "module"
   },
   "action": {
-    "default_title": "同声传译",
-    "default_popup": "popup.html"
+    "default_title": "同声传译(点击或按 Alt+Shift+S 开始/停止)"
   },
+  "commands": {
+    "toggle-translation": {
+      "suggested_key": {
+        "default": "Alt+Shift+S",
+        "mac": "Alt+Shift+S"
+      },
+      "description": "开始/停止同声传译"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "css": ["overlay.css"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
   "web_accessible_resources": [
     {
       "resources": ["audio-worklet.js"],

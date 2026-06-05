@@ -23,6 +23,7 @@ type segState struct {
 	id         string
 	source     string
 	target     string
+	targetLang string // 该 segment 翻译所用的目标语言(用于选 TTS 音色)
 	startTime  int
 	endTime    int
 	seq        int  // 首次出现的序号,用于按时间顺序构造上下文
@@ -50,6 +51,11 @@ type session struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	// 翻译方向:源语言提示(留空=自动识别)与目标语言。由前端 start 消息设置。
+	langMu  sync.RWMutex
+	srcLang string
+	tgtLang string
+
 	// 记录每个 segment 上一次下发的原文,用于去重(避免无变化的重复推送)。
 	segMu         sync.Mutex
 	lastSent      map[string]string
@@ -63,6 +69,7 @@ type session struct {
 type ttsJob struct {
 	segID string
 	text  string
+	lang  string // 目标语言,用于选音色
 }
 
 func newSession(parent context.Context, id string, log *slog.Logger, conn *websocket.Conn) *session {
@@ -82,6 +89,7 @@ func newSession(parent context.Context, id string, log *slog.Logger, conn *webso
 		lastSent:   make(map[string]string),
 		segments:   make(map[string]*segState),
 		lastTTS:    make(map[string]string),
+		tgtLang:    config.TargetLanguage, // 默认目标语言,前端可覆盖
 	}
 	s.asr = asr.NewClient(id, log, asr.Handlers{
 		OnEvent: s.onASREvent,
@@ -91,6 +99,29 @@ func newSession(parent context.Context, id string, log *slog.Logger, conn *webso
 		},
 	})
 	return s
+}
+
+// setLanguages 设置翻译方向(由前端 start 消息携带)。
+// src 为源语言提示(空/"自动检测" 视为自动);tgt 为目标语言(空则保持默认)。
+func (s *session) setLanguages(src, tgt string) {
+	s.langMu.Lock()
+	defer s.langMu.Unlock()
+	src = strings.TrimSpace(src)
+	if src == "自动检测" || src == "auto" {
+		src = ""
+	}
+	s.srcLang = src
+	if t := strings.TrimSpace(tgt); t != "" {
+		s.tgtLang = t
+	}
+	s.log.Info("languages set", slog.String("source", s.srcLang), slog.String("target", s.tgtLang))
+}
+
+// languages 返回当前的源语言提示与目标语言。
+func (s *session) languages() (src, tgt string) {
+	s.langMu.RLock()
+	defer s.langMu.RUnlock()
+	return s.srcLang, s.tgtLang
 }
 
 // start 在后台拉起 ASR 上游连接(含自动重连),并按需启动翻译 / 复审 worker。
@@ -260,7 +291,8 @@ func (s *session) translateSegment(segID string) {
 		return
 	}
 
-	target, err := s.tr.Translate(s.ctx, source, s.buildContext(seq))
+	srcLang, tgtLang := s.languages()
+	target, err := s.tr.Translate(s.ctx, source, s.buildContext(seq), tgtLang, srcLang)
 	if err != nil {
 		s.log.Warn("translate failed", slog.String("seg", segID), slog.String("err", err.Error()))
 		s.writeJSON(map[string]any{"type": "translate_error", "segment_id": segID, "message": err.Error()})
@@ -278,6 +310,7 @@ func (s *session) translateSegment(segID string) {
 		return
 	}
 	st.target = target
+	st.targetLang = tgtLang
 	st.translated = true
 	corrected := st.revised // 本次回填是否源于 ASR 修订
 	st.revised = false
@@ -295,11 +328,11 @@ func (s *session) translateSegment(segID string) {
 	})
 	s.log.Debug("translation backfilled", slog.String("seg", segID), slog.Bool("corrected", corrected))
 
-	s.enqueueTTS(segID, target)
+	s.enqueueTTS(segID, target, tgtLang)
 }
 
-// enqueueTTS 把一段译文加入语音合成队列(非阻塞,去重)。
-func (s *session) enqueueTTS(segID, text string) {
+// enqueueTTS 把一段译文加入语音合成队列(非阻塞,去重)。lang 为目标语言,用于选音色。
+func (s *session) enqueueTTS(segID, text, lang string) {
 	if !s.ttsEnabled || strings.TrimSpace(text) == "" {
 		return
 	}
@@ -312,7 +345,7 @@ func (s *session) enqueueTTS(segID, text string) {
 	s.segMu.Unlock()
 
 	select {
-	case s.ttsQueue <- ttsJob{segID: segID, text: text}:
+	case s.ttsQueue <- ttsJob{segID: segID, text: text, lang: lang}:
 	default:
 		s.log.Warn("tts queue full, drop", slog.String("seg", segID))
 	}
@@ -331,8 +364,14 @@ func (s *session) ttsLoop() {
 }
 
 // synthesize 合成一句译文并把音频(base64)下发前端播放。
+// 按目标语言选音色;该语言未配置音色时跳过(仅出字幕)。
 func (s *session) synthesize(job ttsJob) {
-	audio, format, err := s.tts.Synthesize(s.ctx, job.text)
+	voice := config.TTSVoiceFor(job.lang)
+	if voice == "" {
+		s.log.Debug("tts skipped: 目标语言未配置音色", slog.String("lang", job.lang), slog.String("seg", job.segID))
+		return
+	}
+	audio, format, err := s.tts.SynthesizeWith(s.ctx, job.text, voice)
 	if err != nil {
 		s.log.Warn("tts failed", slog.String("seg", job.segID), slog.String("err", err.Error()))
 		return
@@ -412,7 +451,8 @@ func (s *session) reviewRecent() {
 	s.lastReviewKey = key
 	s.segMu.Unlock()
 
-	revised, err := s.tr.Review(s.ctx, items)
+	_, tgtLang := s.languages()
+	revised, err := s.tr.Review(s.ctx, items, tgtLang)
 	if err != nil {
 		s.log.Debug("review failed", slog.String("err", err.Error()))
 		return
@@ -448,7 +488,7 @@ func (s *session) reviewRecent() {
 			"corrected":  true,
 		})
 		s.log.Debug("review corrected", slog.String("seg", id))
-		s.enqueueTTS(id, newTarget)
+		s.enqueueTTS(id, newTarget, tgtLang)
 	}
 }
 

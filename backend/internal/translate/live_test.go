@@ -31,7 +31,7 @@ func TestLiveTranslateAndReview(t *testing.T) {
 	defer cancel()
 
 	// 1) 基础翻译验证。
-	out, err := c.Translate(ctx, "The patient was prescribed a beta blocker for hypertension.", nil)
+	out, err := c.Translate(ctx, "The patient was prescribed a beta blocker for hypertension.", nil, "", "")
 	if err != nil {
 		t.Fatalf("Translate 失败: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestLiveTranslateAndReview(t *testing.T) {
 		{Source: "The keynote starts at 10am.", Target: "主题演讲上午十点开始。"},
 		{Source: "I ate an apple before the meeting.", Target: "我在会议前吃了一个苹果公司。"},
 	}
-	rev, err := c.Review(ctx, items)
+	rev, err := c.Review(ctx, items, "")
 	if err != nil {
 		t.Fatalf("Review 失败: %v", err)
 	}

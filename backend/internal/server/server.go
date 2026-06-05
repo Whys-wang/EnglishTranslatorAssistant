@@ -78,9 +78,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// clientMessage 是前端通过文本帧发送的控制消息结构(后续里程碑扩展)。
+// clientMessage 是前端通过文本帧发送的控制消息结构。
 type clientMessage struct {
-	Type string `json:"type"` // 例如 "start" / "stop" / "config"
+	Type       string `json:"type"`       // 例如 "start" / "stop" / "config"
+	SourceLang string `json:"sourceLang"` // 源语言提示(空/"自动检测" = 自动)
+	TargetLang string `json:"targetLang"` // 目标语言(翻译成什么语言)
 }
 
 // handleWS 处理一条前端连接的完整生命周期。
@@ -137,7 +139,14 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				log.Warn("bad control message", slog.String("raw", string(data)))
 				continue
 			}
-			log.Info("control message", slog.String("type", m.Type))
+			log.Info("control message",
+				slog.String("type", m.Type),
+				slog.String("source_lang", m.SourceLang),
+				slog.String("target_lang", m.TargetLang),
+			)
+			if m.Type == "start" || m.Type == "config" {
+				sess.setLanguages(m.SourceLang, m.TargetLang)
+			}
 			sess.writeJSON(map[string]any{"type": "ack", "of": m.Type})
 		}
 	}

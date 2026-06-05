@@ -107,17 +107,32 @@ func writeDomainAndGlossary(sb *strings.Builder) {
 	}
 }
 
-// buildSystemPrompt 组装系统提示词,可选附带上下文。
-func buildSystemPrompt(history []Pair) string {
+// resolveTarget 返回有效目标语言:为空时回退到默认(config.TargetLanguage)。
+func resolveTarget(target string) string {
+	if t := strings.TrimSpace(target); t != "" {
+		return t
+	}
+	return config.TargetLanguage
+}
+
+// buildSystemPrompt 组装系统提示词,翻译目标语言为 target;source 为源语言提示
+// (留空表示自动识别,不附加)。可选附带上下文。
+func buildSystemPrompt(history []Pair, target, source string) string {
+	target = resolveTarget(target)
 	var sb strings.Builder
 	sb.WriteString("你是专业的实时同声传译引擎。请把【待翻译原文】翻译成")
-	sb.WriteString(config.TargetLanguage)
+	sb.WriteString(target)
 	sb.WriteString("。要求:\n")
 	sb.WriteString("1. 只输出译文本身,不要输出原文、引号、解释或任何多余内容;\n")
 	sb.WriteString("2. 译文要自然流畅、符合")
-	sb.WriteString(config.TargetLanguage)
+	sb.WriteString(target)
 	sb.WriteString("的口语表达习惯;\n")
 	sb.WriteString("3. 即使原文是一句话的片段也请给出通顺的部分译文,不要补全臆测的内容。\n")
+	if s := strings.TrimSpace(source); s != "" {
+		sb.WriteString("4. 原文语言为")
+		sb.WriteString(s)
+		sb.WriteString(",请据此正确理解原文。\n")
+	}
 	writeDomainAndGlossary(&sb)
 	if len(history) > 0 {
 		sb.WriteString("\n以下是最近的上下文(原文 => 译文),仅供你保持术语、人名与语气一致,切勿翻译或复述它们:\n")
@@ -132,8 +147,9 @@ func buildSystemPrompt(history []Pair) string {
 	return sb.String()
 }
 
-// Translate 把 source 翻译成目标语言;history 为可选上下文。
-func (c *Client) Translate(ctx context.Context, source string, history []Pair) (string, error) {
+// Translate 把 source 翻译成 target(为空回退默认);history 为可选上下文,
+// sourceLang 为可选源语言提示(留空表示自动识别)。
+func (c *Client) Translate(ctx context.Context, source string, history []Pair, target, sourceLang string) (string, error) {
 	source = strings.TrimSpace(source)
 	if source == "" {
 		return "", nil
@@ -142,7 +158,7 @@ func (c *Client) Translate(ctx context.Context, source string, history []Pair) (
 	reqBody := chatRequest{
 		Model: config.ArkModel,
 		Messages: []chatMessage{
-			{Role: "system", Content: buildSystemPrompt(history)},
+			{Role: "system", Content: buildSystemPrompt(history, target, sourceLang)},
 			{Role: "user", Content: "【待翻译原文】\n" + source},
 		},
 		Temperature: config.Translate.Temperature,
@@ -162,7 +178,8 @@ type ReviewItem struct {
 
 // Review 对最近若干句做整体复审纠错:模型可借后文澄清前文的歧义/人名/术语,
 // 返回与输入等长、按顺序排列的「修订后译文」切片(无需修改的句子原样返回)。
-func (c *Client) Review(ctx context.Context, items []ReviewItem) ([]string, error) {
+// target 为目标语言(为空回退默认)。
+func (c *Client) Review(ctx context.Context, items []ReviewItem, target string) ([]string, error) {
 	if len(items) == 0 {
 		return nil, nil
 	}
@@ -184,7 +201,7 @@ func (c *Client) Review(ctx context.Context, items []ReviewItem) ([]string, erro
 	reqBody := chatRequest{
 		Model: config.ArkModel,
 		Messages: []chatMessage{
-			{Role: "system", Content: buildReviewSystemPrompt(len(items))},
+			{Role: "system", Content: buildReviewSystemPrompt(len(items), target)},
 			{Role: "user", Content: string(inJSON)},
 		},
 		Temperature: config.Translate.Temperature,
@@ -258,16 +275,17 @@ func parseStringArray(s string) ([]string, error) {
 	return arr, nil
 }
 
-// buildReviewSystemPrompt 组装复审纠错的系统提示词。
-func buildReviewSystemPrompt(n int) string {
+// buildReviewSystemPrompt 组装复审纠错的系统提示词,目标语言为 target(为空回退默认)。
+func buildReviewSystemPrompt(n int, target string) string {
+	target = resolveTarget(target)
 	var sb strings.Builder
 	sb.WriteString("你是实时同声传译的质检与纠错引擎。用户会给你一个 JSON 数组,按时间先后顺序排列最近几句的 {index, source(原文), target(当前")
-	sb.WriteString(config.TargetLanguage)
+	sb.WriteString(target)
 	sb.WriteString("译文)}。\n")
 	sb.WriteString("请结合【完整上下文】(尤其是后文往往能澄清前文的歧义、人名、术语)逐句校正译文,使整体更准确、连贯、术语一致。要求:\n")
 	sb.WriteString("1. 仅在确有改进时才修改;没有问题的句子原样返回其译文;\n")
 	sb.WriteString("2. 译文须自然流畅、符合")
-	sb.WriteString(config.TargetLanguage)
+	sb.WriteString(target)
 	sb.WriteString("口语习惯,且只对应该句原文,不要合并、拆分或臆测补全;\n")
 	sb.WriteString(fmt.Sprintf("3. 严格只输出一个 JSON 字符串数组,长度必须为 %d,按 index 顺序给出每句修订后的译文,不要输出任何额外文字、键名、序号或注释。", n))
 	writeDomainAndGlossary(&sb)
