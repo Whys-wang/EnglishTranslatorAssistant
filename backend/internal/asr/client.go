@@ -96,8 +96,14 @@ func (c *Client) buildConfigJSON() ([]byte, error) {
 // dialAndInit 建立上游连接并发送首包配置。
 func (c *Client) dialAndInit(ctx context.Context) error {
 	header := http.Header{}
-	header.Set("X-Api-App-Key", config.ASRAppKey)
-	header.Set("X-Api-Access-Key", config.ASRAccessKey)
+	if config.UseNewConsoleAuth {
+		// 新版控制台:仅需 X-Api-Key。
+		header.Set("X-Api-Key", config.SpeechAPIKey)
+	} else {
+		// 旧版控制台:App Key + Access Key。
+		header.Set("X-Api-App-Key", config.ASRAppKey)
+		header.Set("X-Api-Access-Key", config.ASRAccessKey)
+	}
 	header.Set("X-Api-Resource-Id", config.ASRResourceID)
 	header.Set("X-Api-Request-Id", uuid.NewString())
 	header.Set("X-Api-Connect-Id", uuid.NewString())

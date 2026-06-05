@@ -12,11 +12,20 @@ import "time"
 // ASR —— 火山引擎「大模型流式语音识别」(BigModel SAUC)
 // ───────────────────────────────────────────────────────────────────────────
 const (
-	// ASRAppKey 对应请求头 X-Api-App-Key
-	ASRAppKey = "PLEASE_FILL_ASR_APP_KEY" // TODO: 填入真实 App Key
+	// UseNewConsoleAuth 控制鉴权方式:
+	//   true  = 新版控制台:仅需 X-Api-Key(见 SpeechAPIKey),ASR/TTS 共用;
+	//   false = 旧版控制台:使用 X-Api-App-Key + X-Api-Access-Key。
+	UseNewConsoleAuth = true
 
-	// ASRAccessKey 对应请求头 X-Api-Access-Key
-	ASRAccessKey = "PLEASE_FILL_ASR_ACCESS_KEY" // TODO: 填入真实 Access Key
+	// SpeechAPIKey 新版控制台的统一鉴权 Key(请求头 X-Api-Key),语音识别/合成共用。
+	// 仅当 UseNewConsoleAuth = true 时使用。
+	SpeechAPIKey = "PLEASE_FILL_SPEECH_API_KEY" // TODO: 填入真实 API Key
+
+	// ASRAppKey 对应请求头 X-Api-App-Key(旧版控制台)。
+	ASRAppKey = "PLEASE_FILL_ASR_APP_KEY" // TODO: 旧版控制台填入 App ID
+
+	// ASRAccessKey 对应请求头 X-Api-Access-Key(旧版控制台)。
+	ASRAccessKey = "PLEASE_FILL_ASR_ACCESS_KEY" // TODO: 旧版控制台填入 Access Token
 
 	// ASRResourceID 对应请求头 X-Api-Resource-Id,固定值,无需改动。
 	ASRResourceID = "volc.bigasr.sauc.duration"
