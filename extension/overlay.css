@@ -98,7 +98,27 @@
   font-style: italic;
 }
 
-/* 被纠错修订的段做高亮提示(里程碑 6) */
+#__simul_interpreter_overlay__ .si-seg {
+  transition: outline-color 0.4s ease, box-shadow 0.4s ease;
+  outline: 2px solid transparent;
+}
+
+/* 被纠错修订的段(ASR 修订重译 / 周期性复审)做短暂高亮提示(里程碑 6) */
 #__simul_interpreter_overlay__ .si-corrected {
   outline: 2px solid #ffd54f;
+  box-shadow: 0 0 10px rgba(255, 213, 79, 0.55);
+}
+
+/* 纠错时译文做一次轻微的闪现,提示「这句被更新了」 */
+#__simul_interpreter_overlay__ .si-corrected .si-target {
+  animation: si-flash 0.6s ease;
+}
+
+@keyframes si-flash {
+  0% {
+    color: #ffd54f;
+  }
+  100% {
+    color: #fff;
+  }
 }

@@ -16,6 +16,7 @@
 
   const OVERLAY_ID = "__simul_interpreter_overlay__";
   const MAX_LINES = 4; // 字幕条最多同时显示的行数(旧行淘汰)
+  const CORRECTED_HIGHLIGHT_MS = 4000; // 纠错高亮持续时长
 
   function ensureOverlay() {
     let el = document.getElementById(OVERLAY_ID);
@@ -54,9 +55,14 @@
       start_time: msg.start_time ?? prev?.start_time ?? 0,
       end_time: msg.end_time ?? prev?.end_time ?? 0,
       error: "",
+      // 纠错高亮(ASR 修订重译 / 周期性复审)的时间戳,过期后自动淡出。
+      correctedAt: prev?.correctedAt ?? 0,
     };
     if (!next.target && prev && prev.source === next.source && prev.target) {
       next.target = prev.target;
+    }
+    if (msg.corrected) {
+      next.correctedAt = Date.now();
     }
     segments.set(next.segment_id, next);
   }
@@ -106,10 +112,12 @@
 
       const isPartial = seg.status === "partial";
       const translating = seg.status === "final" && !seg.target && !seg.error;
+      const corrected = seg.correctedAt && Date.now() - seg.correctedAt < CORRECTED_HIGHLIGHT_MS;
       row.classList.toggle("si-partial", isPartial);
       row.classList.toggle("si-final", seg.status === "final");
       row.classList.toggle("si-translating", translating);
       row.classList.toggle("si-error", !!seg.error);
+      row.classList.toggle("si-corrected", !!corrected);
 
       row.querySelector(".si-source").textContent = seg.source || "";
 
@@ -132,6 +140,10 @@
       setStatus(""); // 收到第一条字幕后隐藏状态提示
       upsertSegment(msg);
       render();
+      if (msg.corrected) {
+        // 高亮到期后再渲染一次以淡出。
+        setTimeout(render, CORRECTED_HIGHLIGHT_MS + 200);
+      }
     } else if (msg.type === "translate_error") {
       markError(msg.segment_id, msg.message);
       render();

@@ -120,6 +120,62 @@ func (c *Client) Translate(ctx context.Context, source string, history []Pair) (
 		// 翻译是确定性任务,关闭推理模型的深度思考以降低延迟(seed 系列支持)。
 		Thinking: &thinkingOption{Type: "disabled"},
 	}
+	return c.doChat(ctx, reqBody)
+}
+
+// ReviewItem 是一条待复审的字幕(原文 + 当前译文)。
+type ReviewItem struct {
+	Source string
+	Target string
+}
+
+// Review 对最近若干句做整体复审纠错:模型可借后文澄清前文的歧义/人名/术语,
+// 返回与输入等长、按顺序排列的「修订后译文」切片(无需修改的句子原样返回)。
+func (c *Client) Review(ctx context.Context, items []ReviewItem) ([]string, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+
+	type inItem struct {
+		Index  int    `json:"index"`
+		Source string `json:"source"`
+		Target string `json:"target"`
+	}
+	in := make([]inItem, len(items))
+	for i, it := range items {
+		in[i] = inItem{Index: i, Source: it.Source, Target: it.Target}
+	}
+	inJSON, err := json.Marshal(in)
+	if err != nil {
+		return nil, fmt.Errorf("marshal review input: %w", err)
+	}
+
+	reqBody := chatRequest{
+		Model: config.ArkModel,
+		Messages: []chatMessage{
+			{Role: "system", Content: buildReviewSystemPrompt(len(items))},
+			{Role: "user", Content: string(inJSON)},
+		},
+		Temperature: config.Translate.Temperature,
+		Stream:      false,
+		Thinking:    &thinkingOption{Type: "disabled"},
+	}
+	content, err := c.doChat(ctx, reqBody)
+	if err != nil {
+		return nil, err
+	}
+	arr, err := parseStringArray(content)
+	if err != nil {
+		return nil, err
+	}
+	if len(arr) != len(items) {
+		return nil, fmt.Errorf("review length mismatch: got %d want %d", len(arr), len(items))
+	}
+	return arr, nil
+}
+
+// doChat 执行一次非流式 Chat Completions 调用,返回首个 choice 的文本内容。
+func (c *Client) doChat(ctx context.Context, reqBody chatRequest) (string, error) {
 	raw, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", fmt.Errorf("marshal ark request: %w", err)
@@ -154,4 +210,34 @@ func (c *Client) Translate(ctx context.Context, source string, history []Pair) (
 		return "", fmt.Errorf("ark empty choices (raw=%s)", string(body))
 	}
 	return strings.TrimSpace(cr.Choices[0].Message.Content), nil
+}
+
+// parseStringArray 从模型输出里抽取一个 JSON 字符串数组(容忍 ```json 代码块包裹)。
+func parseStringArray(s string) ([]string, error) {
+	s = strings.TrimSpace(s)
+	start := strings.IndexByte(s, '[')
+	end := strings.LastIndexByte(s, ']')
+	if start < 0 || end < 0 || end < start {
+		return nil, fmt.Errorf("review: 输出中未找到 JSON 数组 (raw=%s)", s)
+	}
+	var arr []string
+	if err := json.Unmarshal([]byte(s[start:end+1]), &arr); err != nil {
+		return nil, fmt.Errorf("review: 解析 JSON 数组失败: %w (raw=%s)", err, s)
+	}
+	return arr, nil
+}
+
+// buildReviewSystemPrompt 组装复审纠错的系统提示词。
+func buildReviewSystemPrompt(n int) string {
+	var sb strings.Builder
+	sb.WriteString("你是实时同声传译的质检与纠错引擎。用户会给你一个 JSON 数组,按时间先后顺序排列最近几句的 {index, source(原文), target(当前")
+	sb.WriteString(config.TargetLanguage)
+	sb.WriteString("译文)}。\n")
+	sb.WriteString("请结合【完整上下文】(尤其是后文往往能澄清前文的歧义、人名、术语)逐句校正译文,使整体更准确、连贯、术语一致。要求:\n")
+	sb.WriteString("1. 仅在确有改进时才修改;没有问题的句子原样返回其译文;\n")
+	sb.WriteString("2. 译文须自然流畅、符合")
+	sb.WriteString(config.TargetLanguage)
+	sb.WriteString("口语习惯,且只对应该句原文,不要合并、拆分或臆测补全;\n")
+	sb.WriteString(fmt.Sprintf("3. 严格只输出一个 JSON 字符串数组,长度必须为 %d,按 index 顺序给出每句修订后的译文,不要输出任何额外文字、键名、序号或注释。", n))
+	return sb.String()
 }

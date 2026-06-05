@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"log/slog"
 
@@ -17,12 +18,14 @@ import (
 
 // segState 保存一个 segment 的最新状态,用于翻译上下文与回填。
 type segState struct {
-	id        string
-	source    string
-	target    string
-	startTime int
-	endTime   int
-	seq       int // 首次出现的序号,用于按时间顺序构造上下文
+	id         string
+	source     string
+	target     string
+	startTime  int
+	endTime    int
+	seq        int  // 首次出现的序号,用于按时间顺序构造上下文
+	translated bool // 是否已产生过 final 译文(用于判定 ASR 修订重译)
+	revised    bool // 本次重译是否由 ASR 修订触发(下发时打 corrected 标记)
 }
 
 // session 表示一条前端连接的会话,桥接前端 WebSocket 与上游 ASR / 翻译。
@@ -42,10 +45,11 @@ type session struct {
 	cancel context.CancelFunc
 
 	// 记录每个 segment 上一次下发的原文,用于去重(避免无变化的重复推送)。
-	segMu    sync.Mutex
-	lastSent map[string]string
-	segments map[string]*segState
-	order    []string // segment id 按首次出现顺序
+	segMu         sync.Mutex
+	lastSent      map[string]string
+	segments      map[string]*segState
+	order         []string // segment id 按首次出现顺序
+	lastReviewKey string   // 上次周期性复审的窗口指纹,内容未变则跳过,省调用
 }
 
 func newSession(parent context.Context, id string, log *slog.Logger, conn *websocket.Conn) *session {
@@ -72,11 +76,15 @@ func newSession(parent context.Context, id string, log *slog.Logger, conn *webso
 	return s
 }
 
-// start 在后台拉起 ASR 上游连接(含自动重连),并按需启动翻译 worker。
+// start 在后台拉起 ASR 上游连接(含自动重连),并按需启动翻译 / 复审 worker。
 func (s *session) start() {
 	go s.asr.Run(s.ctx)
 	if s.trEnabled {
 		go s.translateLoop()
+		// 纠错第二层:周期性 LLM 复审(用后文校正前文)。
+		if config.Correction.EnablePeriodicReview {
+			go s.reviewLoop()
+		}
 	} else {
 		s.log.Warn("translation disabled: Ark 未配置(ArkAPIKey/ArkModel 仍是占位符),仅输出原文字幕")
 	}
@@ -146,6 +154,10 @@ func (s *session) onASREvent(ev asr.Event) {
 }
 
 // enqueueTranslate 记录/更新 segment 状态并把它加入翻译队列(非阻塞)。
+//
+// 纠错第一层(ASR 修订重译):若某 segment 已产生过译文,而 ASR 之后又对其
+// 返回了不同的原文,则视为「修订」。开启 EnableASRRevision 时重新翻译并打
+// corrected 标记;关闭时仅更新原文记录、不重译。
 func (s *session) enqueueTranslate(segID, source string, start, end int) {
 	s.segMu.Lock()
 	st, ok := s.segments[segID]
@@ -154,8 +166,19 @@ func (s *session) enqueueTranslate(segID, source string, start, end int) {
 		s.segments[segID] = st
 		s.order = append(s.order, segID)
 	}
+	isRevision := ok && st.translated && st.source != source
+	if isRevision && !config.Correction.EnableASRRevision {
+		st.source = source
+		st.endTime = end
+		s.segMu.Unlock()
+		return
+	}
 	st.source = source
 	st.endTime = end
+	if isRevision {
+		st.revised = true
+		s.log.Debug("asr revision -> retranslate", slog.String("seg", segID))
+	}
 	s.segMu.Unlock()
 
 	select {
@@ -229,6 +252,9 @@ func (s *session) translateSegment(segID string) {
 		return
 	}
 	st.target = target
+	st.translated = true
+	corrected := st.revised // 本次回填是否源于 ASR 修订
+	st.revised = false
 	s.segMu.Unlock()
 
 	s.writeJSON(map[string]any{
@@ -239,8 +265,110 @@ func (s *session) translateSegment(segID string) {
 		"status":     "final",
 		"start_time": start,
 		"end_time":   end,
+		"corrected":  corrected,
 	})
-	s.log.Debug("translation backfilled", slog.String("seg", segID))
+	s.log.Debug("translation backfilled", slog.String("seg", segID), slog.Bool("corrected", corrected))
+}
+
+// reviewLoop 周期性触发 LLM 复审纠错,直到会话结束。
+func (s *session) reviewLoop() {
+	interval := config.Correction.ReviewInterval
+	if interval <= 0 {
+		interval = 3 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			s.reviewRecent()
+		}
+	}
+}
+
+// reviewRecent 取最近 N 段「原文+译文」整体送 LLM 复审,把被改进的译文原地更新。
+func (s *session) reviewRecent() {
+	win := config.Correction.ReviewContextWindow
+	if win <= 0 {
+		win = 5
+	}
+
+	// 1) 快照最近 win 段已翻译的 segment(在锁内只做拷贝,不发网络请求)。
+	s.segMu.Lock()
+	var ids []string
+	for _, id := range s.order {
+		st := s.segments[id]
+		if st != nil && st.translated && strings.TrimSpace(st.source) != "" && strings.TrimSpace(st.target) != "" {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) > win {
+		ids = ids[len(ids)-win:]
+	}
+	items := make([]translate.ReviewItem, 0, len(ids))
+	srcSnap := make([]string, 0, len(ids))
+	tgtSnap := make([]string, 0, len(ids))
+	for _, id := range ids {
+		st := s.segments[id]
+		items = append(items, translate.ReviewItem{Source: st.source, Target: st.target})
+		srcSnap = append(srcSnap, st.source)
+		tgtSnap = append(tgtSnap, st.target)
+	}
+	s.segMu.Unlock()
+
+	if len(items) < 2 {
+		return // 不足两句,没有「用后文校正前文」的意义
+	}
+
+	// 2) 窗口内容与上次复审完全一致则跳过,避免无谓的接口调用。
+	key := strings.Join(srcSnap, "\x1f") + "\x1e" + strings.Join(tgtSnap, "\x1f")
+	s.segMu.Lock()
+	if key == s.lastReviewKey {
+		s.segMu.Unlock()
+		return
+	}
+	s.lastReviewKey = key
+	s.segMu.Unlock()
+
+	revised, err := s.tr.Review(s.ctx, items)
+	if err != nil {
+		s.log.Debug("review failed", slog.String("err", err.Error()))
+		return
+	}
+	if len(revised) != len(ids) {
+		return
+	}
+
+	// 3) 仅覆盖确有改动、且自快照以来未被更新过的 segment。
+	for i, id := range ids {
+		newTarget := strings.TrimSpace(revised[i])
+		if newTarget == "" || newTarget == tgtSnap[i] {
+			continue
+		}
+		s.segMu.Lock()
+		st := s.segments[id]
+		if st == nil || st.source != srcSnap[i] || st.target != tgtSnap[i] {
+			s.segMu.Unlock() // 期间已有更新的重译,放弃这次复审结果
+			continue
+		}
+		st.target = newTarget
+		source, start, end := st.source, st.startTime, st.endTime
+		s.segMu.Unlock()
+
+		s.writeJSON(map[string]any{
+			"type":       "subtitle",
+			"segment_id": id,
+			"source":     source,
+			"target":     newTarget,
+			"status":     "final",
+			"start_time": start,
+			"end_time":   end,
+			"corrected":  true,
+		})
+		s.log.Debug("review corrected", slog.String("seg", id))
+	}
 }
 
 func (s *session) onASRError(err error) {
