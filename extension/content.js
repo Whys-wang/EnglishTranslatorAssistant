@@ -1,50 +1,68 @@
-// content.js —— 在页面中注入双语字幕 overlay。
+// content.js —— 页面内的「桌宠控制台」+ 双语字幕 overlay。
 //
-// 由 background.js 在「开始翻译」时通过 chrome.scripting 主动注入,
-// 因此可能被重复注入;下面的守卫保证只初始化一次(幂等)。
+// 通过 manifest 的 content_scripts 在每个页面自动注入:只要扩展开着,
+// 打开任意网页桌宠就常驻在页面上。桌宠即控制台:
+//   - 点击桌宠展开控制面板:选择源/目标语言、查看状态、停止翻译;
+//   - 「开始翻译」受浏览器限制必须由扩展调用,故绑定快捷键 Alt+Shift+S(见 background);
+//   - 拖动桌宠可移动(位置记忆);有译文时张嘴并冒气泡。
 //
-// 里程碑 5:双语字幕 UI。
-//   - partial(中间结果)灰显斜体,final(定稿)正常显示;
-//   - 同一 segment_id 原地更新(partial→final、译文异步回填都不新增行);
-//   - final 但译文未到时显示「翻译中…」占位,回填后替换;
-//   - 字幕按 start_time 时间顺序排列,只保留最近若干行,旧行自动淘汰;
-//   - 处理 translate_error:保留原文并提示翻译失败。
+// 字幕 overlay(翻译进行中才出现):
+//   - partial 灰显斜体,final 定稿;同一 segment_id 原地更新;译文异步回填;
+//   - 纠错高亮;按时间排序,仅保留最近若干行。
 
 (() => {
   if (window.__simulInterpreterInjected) return;
   window.__simulInterpreterInjected = true;
 
   const OVERLAY_ID = "__simul_interpreter_overlay__";
-  const MAX_LINES = 4; // 字幕条最多同时显示的行数(旧行淘汰)
-  const CORRECTED_HIGHLIGHT_MS = 4000; // 纠错高亮持续时长
+  const PET_ID = "__simul_interpreter_pet__";
+  const MAX_LINES = 4;
+  const CORRECTED_HIGHLIGHT_MS = 4000;
+
+  // 当前「开始/停止」快捷键(由 background 查询 chrome.commands 回填;用户可改)。
+  let currentShortcut = "Alt+Shift+S";
+  function idleHint() {
+    return currentShortcut
+      ? `已停止 · 按 ${currentShortcut} 开始`
+      : "已停止 · 未设置快捷键(点下方「更改快捷键」)";
+  }
+
+  // 语言选项(value 必须与后端识别的语言名一致;源语言空串=自动检测)。
+  const SOURCE_LANGS = [
+    ["", "自动检测"],
+    ["英语", "英语"],
+    ["中文", "中文"],
+    ["日语", "日语"],
+    ["韩语", "韩语"],
+    ["法语", "法语"],
+    ["德语", "德语"],
+    ["西班牙语", "西班牙语"],
+    ["俄语", "俄语"],
+    ["粤语", "粤语"],
+  ];
+  const TARGET_LANGS = SOURCE_LANGS.filter(([v]) => v !== "");
+
+  let running = false;
+
+  // ── 字幕 overlay ────────────────────────────────────────────────────
+  const segments = new Map();
 
   function ensureOverlay() {
     let el = document.getElementById(OVERLAY_ID);
     if (el) return el;
     el = document.createElement("div");
     el.id = OVERLAY_ID;
-    el.innerHTML = `<div class="si-status"></div><div class="si-subtitle-list"></div>`;
+    el.innerHTML = `<div class="si-subtitle-list"></div>`;
     document.documentElement.appendChild(el);
     return el;
   }
 
-  // setStatus 在字幕条顶部显示一行状态(注入确认 / 等待语音),收到字幕后自动隐藏。
-  function setStatus(text) {
-    const overlay = ensureOverlay();
-    const el = overlay.querySelector(".si-status");
-    el.textContent = text || "";
-    el.style.display = text ? "block" : "none";
+  function removeOverlay() {
+    const el = document.getElementById(OVERLAY_ID);
+    if (el) el.remove();
+    segments.clear();
   }
 
-  // 注入成功后立即给出可见反馈,便于确认内容脚本已就位。
-  setStatus("🟢 同声传译已就绪,等待语音…");
-
-  // segments: segment_id -> { segment_id, source, target, status, start_time, end_time, error }
-  const segments = new Map();
-
-  // upsertSegment 合并增量:后端每条 subtitle 都带 source,
-  // 但 ASR 定稿先到(target 为空)、译文随后异步回填。
-  // 当新消息的 target 为空且原文未变时,保留已有译文,避免译文「闪掉」。
   function upsertSegment(msg) {
     const prev = segments.get(msg.segment_id);
     const next = {
@@ -55,15 +73,12 @@
       start_time: msg.start_time ?? prev?.start_time ?? 0,
       end_time: msg.end_time ?? prev?.end_time ?? 0,
       error: "",
-      // 纠错高亮(ASR 修订重译 / 周期性复审)的时间戳,过期后自动淡出。
       correctedAt: prev?.correctedAt ?? 0,
     };
     if (!next.target && prev && prev.source === next.source && prev.target) {
       next.target = prev.target;
     }
-    if (msg.corrected) {
-      next.correctedAt = Date.now();
-    }
+    if (msg.corrected) next.correctedAt = Date.now();
     segments.set(next.segment_id, next);
   }
 
@@ -74,7 +89,6 @@
     segments.set(segmentId, seg);
   }
 
-  // visibleSegments 按 start_time 升序排序,只取最近 MAX_LINES 行。
   function visibleSegments() {
     const all = [...segments.values()].sort(
       (a, b) => a.start_time - b.start_time || a.segment_id.localeCompare(b.segment_id)
@@ -88,7 +102,6 @@
     const visible = visibleSegments();
     const keep = new Set(visible.map((s) => s.segment_id));
 
-    // 删除已滚出可视窗口的旧行。
     list.querySelectorAll(".si-seg").forEach((row) => {
       if (!keep.has(row.dataset.seg)) row.remove();
     });
@@ -102,7 +115,6 @@
         row.dataset.seg = seg.segment_id;
         row.innerHTML = `<div class="si-source"></div><div class="si-target"></div>`;
       }
-      // 按时间顺序重新插入,保证排序正确(revision / 迟到分句也归位)。
       if (prevRow) {
         if (prevRow.nextSibling !== row) list.insertBefore(row, prevRow.nextSibling);
       } else if (list.firstChild !== row) {
@@ -129,30 +141,240 @@
       } else if (translating) {
         targetEl.textContent = "翻译中…";
       } else {
-        targetEl.textContent = ""; // partial 阶段暂不显示译文行
+        targetEl.textContent = "";
       }
     }
   }
 
+  // ── 桌宠控制台(可拖动) ─────────────────────────────────────────────
+  let petTalkTimer = null;
+  let petBubbleTimer = null;
+
+  const PET_SVG = `
+<svg viewBox="0 0 120 120" width="76" height="76" xmlns="http://www.w3.org/2000/svg">
+  <ellipse cx="60" cy="111" rx="29" ry="6" fill="rgba(0,0,0,0.18)"/>
+  <defs>
+    <linearGradient id="siPetG" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7cc6ff"/>
+      <stop offset="1" stop-color="#4a8fe7"/>
+    </linearGradient>
+  </defs>
+  <path d="M22 62 A38 38 0 0 1 98 62" fill="none" stroke="#2f3b52" stroke-width="7" stroke-linecap="round"/>
+  <rect x="14" y="55" width="16" height="27" rx="7" fill="#2f3b52"/>
+  <rect x="90" y="55" width="16" height="27" rx="7" fill="#2f3b52"/>
+  <circle cx="60" cy="67" r="36" fill="url(#siPetG)"/>
+  <ellipse cx="48" cy="63" rx="7" ry="8.5" fill="#fff"/>
+  <ellipse cx="72" cy="63" rx="7" ry="8.5" fill="#fff"/>
+  <circle cx="49" cy="65" r="3.6" fill="#22304a"/>
+  <circle cx="73" cy="65" r="3.6" fill="#22304a"/>
+  <circle cx="50.6" cy="63.4" r="1.2" fill="#fff"/>
+  <circle cx="74.6" cy="63.4" r="1.2" fill="#fff"/>
+  <ellipse cx="40" cy="75" rx="5" ry="3" fill="#ff9bb3" opacity="0.75"/>
+  <ellipse cx="80" cy="75" rx="5" ry="3" fill="#ff9bb3" opacity="0.75"/>
+  <ellipse class="si-pet-mouth" cx="60" cy="79" rx="6" ry="3.2" fill="#22304a"/>
+</svg>`;
+
+  function buildOptions(list, selected) {
+    return list
+      .map(([v, label]) => `<option value="${v}"${v === selected ? " selected" : ""}>${label}</option>`)
+      .join("");
+  }
+
+  function ensurePet() {
+    let pet = document.getElementById(PET_ID);
+    if (pet) return pet;
+    pet = document.createElement("div");
+    pet.id = PET_ID;
+    pet.innerHTML = `
+      <div class="si-pet-panel">
+        <div class="si-pet-title">同声传译</div>
+        <div class="si-pet-status">${idleHint()}</div>
+        <label class="si-pet-field">源语言
+          <select class="si-pet-src">${buildOptions(SOURCE_LANGS, "")}</select>
+        </label>
+        <label class="si-pet-field">译为
+          <select class="si-pet-tgt">${buildOptions(TARGET_LANGS, "中文")}</select>
+        </label>
+        <button class="si-pet-stop" type="button">停止翻译</button>
+        <div class="si-pet-shortcut">开始/停止快捷键:<b class="si-pet-key">${currentShortcut || "未设置"}</b></div>
+        <button class="si-pet-shortcut-btn" type="button">更改快捷键</button>
+      </div>
+      <div class="si-pet-bubble"></div>
+      <div class="si-pet-body" title="点我展开 · 拖我移动">${PET_SVG}</div>`;
+    document.documentElement.appendChild(pet);
+
+    // 恢复语言选择。
+    const srcSel = pet.querySelector(".si-pet-src");
+    const tgtSel = pet.querySelector(".si-pet-tgt");
+    try {
+      chrome.storage?.local?.get(["sourceLang", "targetLang"], (r) => {
+        if (typeof r?.sourceLang === "string") srcSel.value = r.sourceLang;
+        if (r?.targetLang) tgtSel.value = r.targetLang;
+      });
+    } catch {}
+    srcSel.addEventListener("change", () => {
+      try { chrome.storage?.local?.set({ sourceLang: srcSel.value }); } catch {}
+    });
+    tgtSel.addEventListener("change", () => {
+      try { chrome.storage?.local?.set({ targetLang: tgtSel.value }); } catch {}
+    });
+    // 防止下拉/按钮交互被拖动逻辑吞掉。
+    pet.querySelector(".si-pet-panel").addEventListener("pointerdown", (e) => e.stopPropagation());
+    pet.querySelector(".si-pet-stop").addEventListener("click", () => {
+      try {
+        chrome.runtime.sendMessage({ target: "background", type: "stop" });
+      } catch {}
+      setRunning(false);
+    });
+    pet.querySelector(".si-pet-shortcut-btn").addEventListener("click", () => {
+      try {
+        chrome.runtime.sendMessage({ target: "background", type: "openShortcuts" });
+      } catch {}
+    });
+
+    restorePetPos(pet);
+    makePetDraggable(pet);
+    setRunning(running);
+    return pet;
+  }
+
+  function setRunning(on) {
+    running = !!on;
+    const pet = document.getElementById(PET_ID);
+    if (!pet) return;
+    pet.classList.toggle("si-pet-running", running);
+    const statusEl = pet.querySelector(".si-pet-status");
+    if (statusEl) statusEl.textContent = running ? "翻译中…" : idleHint();
+    if (!running) removeOverlay();
+  }
+
+  // 向后端查询运行状态与当前快捷键,并刷新桌宠显示。
+  function refreshState() {
+    try {
+      chrome.runtime.sendMessage({ target: "background", type: "getState" }, (resp) => {
+        if (chrome.runtime.lastError || !resp) return;
+        if (typeof resp.shortcut === "string") {
+          currentShortcut = resp.shortcut;
+          const pet = document.getElementById(PET_ID);
+          const keyEl = pet?.querySelector(".si-pet-key");
+          if (keyEl) keyEl.textContent = currentShortcut || "未设置";
+        }
+        if (typeof resp.running === "boolean") setRunning(resp.running);
+      });
+    } catch {}
+  }
+
+  function makePetDraggable(pet) {
+    const handle = pet.querySelector(".si-pet-body");
+    let dragging = false;
+    let moved = false;
+    let startX = 0;
+    let startY = 0;
+    let originLeft = 0;
+    let originTop = 0;
+
+    handle.addEventListener("pointerdown", (e) => {
+      dragging = true;
+      moved = false;
+      startX = e.clientX;
+      startY = e.clientY;
+      const rect = pet.getBoundingClientRect();
+      originLeft = rect.left;
+      originTop = rect.top;
+      pet.classList.add("si-pet-dragging");
+      try { handle.setPointerCapture(e.pointerId); } catch {}
+      e.preventDefault();
+    });
+
+    handle.addEventListener("pointermove", (e) => {
+      if (!dragging) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
+      const maxL = window.innerWidth - pet.offsetWidth;
+      const maxT = window.innerHeight - pet.offsetHeight;
+      const left = Math.max(0, Math.min(originLeft + dx, maxL));
+      const top = Math.max(0, Math.min(originTop + dy, maxT));
+      pet.style.left = left + "px";
+      pet.style.top = top + "px";
+      pet.style.right = "auto";
+      pet.style.bottom = "auto";
+    });
+
+    const end = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      pet.classList.remove("si-pet-dragging");
+      try { handle.releasePointerCapture(e.pointerId); } catch {}
+      savePetPos(pet);
+      if (!moved) {
+        pet.classList.toggle("si-pet-open"); // 没拖动 = 点击,展开/收起面板
+        if (pet.classList.contains("si-pet-open")) refreshState(); // 展开时刷新状态与快捷键
+      }
+    };
+    handle.addEventListener("pointerup", end);
+    handle.addEventListener("pointercancel", end);
+  }
+
+  function savePetPos(pet) {
+    try {
+      chrome.storage?.local?.set({ petPos: { left: pet.style.left, top: pet.style.top } });
+    } catch {}
+  }
+
+  function restorePetPos(pet) {
+    try {
+      chrome.storage?.local?.get("petPos", (r) => {
+        if (r && r.petPos && r.petPos.left) {
+          pet.style.left = r.petPos.left;
+          pet.style.top = r.petPos.top;
+          pet.style.right = "auto";
+          pet.style.bottom = "auto";
+        }
+      });
+    } catch {}
+  }
+
+  function petTalk() {
+    const pet = ensurePet();
+    pet.classList.add("si-pet-talking");
+    clearTimeout(petTalkTimer);
+    petTalkTimer = setTimeout(() => pet.classList.remove("si-pet-talking"), 1600);
+  }
+
+  function petSay(text) {
+    if (!text) return;
+    const pet = ensurePet();
+    const bubble = pet.querySelector(".si-pet-bubble");
+    bubble.textContent = text;
+    bubble.classList.add("si-show");
+    clearTimeout(petBubbleTimer);
+    petBubbleTimer = setTimeout(() => bubble.classList.remove("si-show"), 4000);
+  }
+
+  // ── 消息处理 ────────────────────────────────────────────────────────
   chrome.runtime.onMessage.addListener((msg) => {
-    // channel 是路由键;msg.target 留给「译文」字段,二者不可混用。
     if (msg?.channel !== "page-subtitle") return;
     if (msg.type === "subtitle") {
-      setStatus(""); // 收到第一条字幕后隐藏状态提示
+      setRunning(true);
       upsertSegment(msg);
       render();
-      if (msg.corrected) {
-        // 高亮到期后再渲染一次以淡出。
-        setTimeout(render, CORRECTED_HIGHLIGHT_MS + 200);
+      if (msg.target) {
+        petSay(msg.target);
+        petTalk();
       }
+      if (msg.corrected) setTimeout(render, CORRECTED_HIGHLIGHT_MS + 200);
     } else if (msg.type === "translate_error") {
       markError(msg.segment_id, msg.message);
       render();
+    } else if (msg.type === "state") {
+      setRunning(!!msg.running);
     } else if (msg.type === "clear") {
-      // 停止翻译:移除整个 overlay(含状态条与字幕)。
-      segments.clear();
-      const el = document.getElementById(OVERLAY_ID);
-      if (el) el.remove();
+      setRunning(false);
     }
   });
+
+  ensurePet();
+  // 注入后查询运行状态与当前快捷键(刷新页面或补注入时恢复显示)。
+  refreshState();
 })();

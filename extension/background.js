@@ -59,8 +59,8 @@ async function ensureContentScript(tabId) {
 
 let rxCount = 0;
 
-async function startCapture(tabId) {
-  console.log("[SI] startCapture, tabId =", tabId);
+async function startCapture(tabId, sourceLang, targetLang) {
+  console.log("[SI] startCapture, tabId =", tabId, "lang =", sourceLang, "->", targetLang);
   await setActiveTab(tabId);
   rxCount = 0;
   try {
@@ -81,22 +81,101 @@ async function startCapture(tabId) {
   });
   console.log("[SI] 取得 streamId =", streamId);
 
-  // 交给 offscreen 去真正采集音频。
+  // 交给 offscreen 去真正采集音频(带上翻译方向)。
   chrome.runtime.sendMessage({
     target: "offscreen",
     type: "start",
     streamId,
     tabId,
+    sourceLang,
+    targetLang,
   });
   console.log("[SI] 已通知 offscreen 开始采集");
+
+  // 通知页面桌宠:已进入「翻译中」状态。
+  try {
+    await chrome.tabs.sendMessage(tabId, { channel: "page-subtitle", type: "state", running: true });
+  } catch (e) {
+    /* 页面可能还没就绪 */
+  }
+}
+
+// toggleTranslation 由快捷键 / 图标触发:未在翻译则开始(抓当前标签页),否则停止。
+// 注意:tabCapture 必须由「扩展被调用」(快捷键/图标)触发,不能由网页内的桌宠直接发起。
+async function toggleTranslation(tab) {
+  const active = await getActiveTab();
+  if (active != null) {
+    await stopCapture();
+    return;
+  }
+  const tabId = tab?.id;
+  if (tabId == null) {
+    console.warn("[SI] toggle: 无法确定当前标签页");
+    return;
+  }
+  const { sourceLang = "", targetLang = "中文" } = await chrome.storage.local.get([
+    "sourceLang",
+    "targetLang",
+  ]);
+  try {
+    await startCapture(tabId, sourceLang, targetLang);
+  } catch (e) {
+    console.error("[SI] 启动失败", e);
+    setBadge("ERR", "#d23b3b");
+    chrome.action.setTitle({ title: "启动失败:" + String(e) });
+  }
+}
+
+// 快捷键(默认 Alt+Shift+S)与点击扩展图标都用来开始/停止。
+chrome.commands.onCommand.addListener((command, tab) => {
+  if (command === "toggle-translation") toggleTranslation(tab);
+});
+chrome.action.onClicked.addListener((tab) => toggleTranslation(tab));
+
+// 让桌宠对「当前已经打开的所有标签页」也立即出现:
+// content_scripts 只对之后新加载的页面注入,已打开的旧标签页需要主动补注入。
+// 扩展安装/更新/浏览器启动时各跑一次,用户就不必逐页点击或刷新。
+async function injectPetIntoOpenTabs() {
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: ["http://*/*", "https://*/*"] });
+  } catch (e) {
+    return;
+  }
+  for (const t of tabs) {
+    if (t.id == null) continue;
+    chrome.scripting.insertCSS({ target: { tabId: t.id }, files: ["overlay.css"] }).catch(() => {});
+    chrome.scripting.executeScript({ target: { tabId: t.id }, files: ["content.js"] }).catch(() => {});
+  }
+}
+chrome.runtime.onInstalled.addListener(injectPetIntoOpenTabs);
+chrome.runtime.onStartup.addListener(injectPetIntoOpenTabs);
+
+// 打开浏览器的扩展快捷键设置页(Edge / Chrome 路径不同)。
+function openShortcutsPage() {
+  const isEdge = navigator.userAgent.includes("Edg");
+  const url = isEdge ? "edge://extensions/shortcuts" : "chrome://extensions/shortcuts";
+  chrome.tabs.create({ url }).catch(() => {});
+}
+
+// 读取「toggle-translation」当前实际绑定的快捷键(用户可能改过)。
+async function currentShortcut() {
+  try {
+    const cmds = await chrome.commands.getAll();
+    const c = cmds.find((x) => x.name === "toggle-translation");
+    return c?.shortcut || "";
+  } catch (e) {
+    return "";
+  }
 }
 
 async function stopCapture() {
   chrome.runtime.sendMessage({ target: "offscreen", type: "stop" });
   const tabId = await getActiveTab();
   if (tabId != null) {
-    // 通知页面移除字幕 overlay(含绿色状态条)。
+    // 通知页面:翻译已停止(桌宠回到待机,字幕 overlay 清空;桌宠本体保留)。
     try {
+      await chrome.tabs.sendMessage(tabId, { channel: "page-subtitle", type: "state", running: false });
       await chrome.tabs.sendMessage(tabId, { channel: "page-subtitle", type: "clear" });
     } catch (e) {
       /* 标签页可能已关闭 */
@@ -143,12 +222,12 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onDisconnect.addListener(() => console.log("[SI] offscreen 端口断开"));
 });
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   console.log("[SI] 收到消息 target =", msg?.target, "type =", msg?.type);
-  // 来自 popup 的控制
+  // 来自桌宠 / (兼容)旧 popup 的控制
   if (msg?.target === "background") {
     if (msg.type === "start") {
-      startCapture(msg.tabId).then(
+      startCapture(msg.tabId, msg.sourceLang, msg.targetLang).then(
         () => sendResponse({ ok: true }),
         (err) => sendResponse({ ok: false, error: String(err) })
       );
@@ -156,6 +235,19 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     }
     if (msg.type === "stop") {
       stopCapture().then(() => sendResponse({ ok: true }));
+      return true;
+    }
+    // 桌宠注入后询问:本标签页是否正在翻译 + 当前快捷键(用于显示与刷新)。
+    if (msg.type === "getState") {
+      Promise.all([getActiveTab(), currentShortcut()]).then(([active, shortcut]) => {
+        sendResponse({ running: active != null && active === sender?.tab?.id, shortcut });
+      });
+      return true;
+    }
+    // 桌宠「更改快捷键」按钮:打开浏览器的扩展快捷键设置页。
+    if (msg.type === "openShortcuts") {
+      openShortcutsPage();
+      sendResponse({ ok: true });
       return true;
     }
   }
