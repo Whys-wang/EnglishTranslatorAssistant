@@ -11,6 +11,8 @@
 # 日志 / 临时
 *.log
 goversion.txt
+*.pid
+backend.pid
 
 # 编辑器 / 系统
 .DS_Store

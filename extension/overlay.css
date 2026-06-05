@@ -11,6 +11,16 @@
   font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
 }
 
+#__simul_interpreter_overlay__ .si-status {
+  background: rgba(16, 132, 70, 0.92);
+  color: #fff;
+  font-size: 14px;
+  padding: 6px 14px;
+  border-radius: 8px;
+  text-align: center;
+  margin-bottom: 6px;
+}
+
 #__simul_interpreter_overlay__ .si-subtitle-list {
   display: flex;
   flex-direction: column;
@@ -36,11 +46,56 @@
   font-weight: 600;
 }
 
-/* partial(中间结果)灰显、斜体 */
-#__simul_interpreter_overlay__ .si-partial .si-target {
-  color: #b0b0b0;
+/* 译文为空(partial 阶段)时收起译文行,避免留白 */
+#__simul_interpreter_overlay__ .si-target:empty {
+  display: none;
+}
+
+/* 历史(已被新行挤上去的)行整体淡一点,聚焦最新一句 */
+#__simul_interpreter_overlay__ .si-seg:not(:last-child) {
+  opacity: 0.78;
+}
+
+/* partial(中间结果):整段灰显、斜体,弱化未定稿内容 */
+#__simul_interpreter_overlay__ .si-partial {
+  opacity: 0.85;
+}
+
+#__simul_interpreter_overlay__ .si-partial .si-source {
+  font-style: italic;
+}
+
+/* final(定稿):原文弱化、译文为主,形成清晰的双语层次 */
+#__simul_interpreter_overlay__ .si-final .si-source {
+  font-size: 13px;
+  opacity: 0.55;
+}
+
+/* final 但译文尚未回填:显示「翻译中…」占位,做轻微呼吸动画 */
+#__simul_interpreter_overlay__ .si-translating .si-target {
+  color: #cfcfcf;
   font-style: italic;
   font-weight: 400;
+  font-size: 16px;
+  animation: si-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes si-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+/* 翻译失败:译文行显示降级提示 */
+#__simul_interpreter_overlay__ .si-error .si-target {
+  color: #ffb4a2;
+  font-size: 14px;
+  font-weight: 400;
+  font-style: italic;
 }
 
 /* 被纠错修订的段做高亮提示(里程碑 6) */

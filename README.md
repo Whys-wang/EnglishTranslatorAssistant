@@ -2,7 +2,7 @@
 
 把单向外语音频流实时翻译成**中文双语字幕**(可选 TTS 语音)的助手。核心难点是**低延迟**与**自动纠正此前的识别/翻译错误**。
 
-> 当前进度:里程碑 4 —— 接入方舟翻译(final 分句异步翻译、上下文窗口、回填 segment)。
+> 当前进度:里程碑 5 —— 双语字幕 UI(partial 灰显、final 定稿、译文异步回填原地更新、按时间排序只留最近若干行)。
 
 ## 架构
 
@@ -84,6 +84,9 @@ curl http://localhost:8765/healthz
 
 > 翻译(里程碑 4):每当一句被 ASR 定稿(final),后端会带上最近 `Translate.ContextWindow` 段「原文 => 译文」作为上下文,异步调用方舟(Ark)翻译,再以相同 `segment_id` 下发一条带 `target` 的 `subtitle` 事件原地回填译文。**需要先把 `config.go` 中的 `ArkAPIKey` 与 `ArkModel` 填成真实值**,否则后端会打印 `translation disabled` 警告并只显示原文。
 
+> 字幕 UI(里程碑 5):页面底部 overlay 以 `segment_id` 为键原地更新字幕——
+> partial(中间结果)整段灰显斜体;final(定稿)原文弱化、译文为主;final 但译文尚未回填时显示「翻译中…」呼吸占位,回填后无缝替换;翻译失败(`translate_error`)则保留原文并提示降级。字幕按 `start_time` 时间排序,只保留最近 4 行(旧行自动淘汰),最新一句最醒目。
+
 ## 如何演示
 
 (里程碑 9 补充完整演示脚本。)当前可演示:启动后端 → 加载扩展 → 开始 → 后端结构化日志显示客户端连接、控制消息与音频帧统计。
@@ -94,7 +97,7 @@ curl http://localhost:8765/healthz
 2. [x] feat: 前端音频采集与分片(tabCapture→16k PCM→WebSocket)
 3. [x] feat: 接入火山 ASR 流式(二进制协议解析,partial/final)
 4. [x] feat: 接入方舟翻译(分句、上下文窗口、回填 segment)
-5. [ ] feat: 双语字幕 UI(partial 灰显、final 定稿、原地更新)
+5. [x] feat: 双语字幕 UI(partial 灰显、final 定稿、原地更新)
 6. [ ] feat: 纠错能力(ASR 修订重译 + 周期性 LLM 复审)
 7. [ ] feat: 接入火山 TTS 双向流式(可开关)
 8. [ ] feat: 术语表/领域提示词 + perf: 延迟优化与重连
