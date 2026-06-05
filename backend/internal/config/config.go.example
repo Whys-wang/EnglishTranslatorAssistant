@@ -59,7 +59,7 @@ var ASRRequest = ASRRequestConfig{
 	EnableDDC:      false,
 	ShowUtterances: true,
 	ResultType:     "full",
-	EndWindowSize:  400, // 静音 400ms 即判停定稿:更快跟上语速、尽早出译文(过低会切碎句子)
+	EndWindowSize:  280, // 静音 280ms 即判停:更激进地切句,让 final 译文尽早出来
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -181,8 +181,8 @@ var Translate = TranslateConfig{
 	Temperature:        0.3,
 	MaxTokens:          256, // 单句译文足够;上限收紧让生成更快收尾
 	PartialPreview:     true,
-	PartialMinChars:    4,
-	PartialMinInterval: 350 * time.Millisecond,
+	PartialMinChars:    2,                      // 每多 2 字就送译,边说边译跟得更紧
+	PartialMinInterval: 180 * time.Millisecond, // partial 译文刷新节流间隔
 }
 
 // ───────────────────────────────────────────────────────────────────────────

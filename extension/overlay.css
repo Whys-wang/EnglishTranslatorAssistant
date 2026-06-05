@@ -1,139 +1,106 @@
-/* overlay.css —— 双语字幕 overlay 样式 */
+/* overlay.css —— 流式字幕条样式
+ *
+ * 借鉴 Google Live Caption / Apple Live Captions:屏幕底部一条固定的字幕条,
+ * 内容像打字机一样持续追加,永不主动消失。
+ *   - .si-committed:已定稿(final)部分,饱满白色;
+ *   - .si-tentative:当前说话中(partial)部分,接在末尾,略微弱化提示"还在变";
+ *   - JS 已对总长做了滑动窗口截断(MAX_TARGET_CHARS),CSS 再用 line-clamp
+ *     兜底,确保任何情况下都不会撑高超过 2 行。
+ */
 
 #__simul_interpreter_overlay__ {
   position: fixed;
   left: 50%;
-  bottom: 6%;
+  bottom: 8%;
   transform: translateX(-50%);
   z-index: 2147483647;
-  max-width: 80vw;
+  max-width: 86vw;
   pointer-events: none;
   font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  /* 字幕主色:外层 CSS 变量,桌宠面板的颜色选择会写到 overlay.style 上 */
+  --si-caption-color: #ffffff;
 }
 
-#__simul_interpreter_overlay__ .si-status {
-  background: rgba(16, 132, 70, 0.92);
-  color: #fff;
-  font-size: 14px;
-  padding: 6px 14px;
-  border-radius: 8px;
-  text-align: center;
-  margin-bottom: 6px;
+/* 用户手动拖动过位置时,清掉默认的「底部居中」锚定,改用 left/top 直接定位 */
+#__simul_interpreter_overlay__.si-positioned {
+  left: 0;
+  bottom: auto;
+  transform: none;
 }
 
-#__simul_interpreter_overlay__ .si-subtitle-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-#__simul_interpreter_overlay__ .si-seg {
-  background: rgba(0, 0, 0, 0.72);
-  color: #fff;
-  padding: 8px 14px;
-  border-radius: 8px;
-  line-height: 1.4;
-  text-align: center;
-}
-
-/* 仅显示目标语言字幕:隐藏原文行 */
-#__simul_interpreter_overlay__ .si-source {
+/* 无内容时整条隐藏(避免显示一个黑色空条) */
+#__simul_interpreter_overlay__.si-empty {
   display: none;
 }
 
-#__simul_interpreter_overlay__ .si-target {
+#__simul_interpreter_overlay__ .si-caption {
+  background: rgba(0, 0, 0, 0.78);
+  color: var(--si-caption-color, #ffffff);
+  padding: 10px 18px;
+  border-radius: 10px;
   font-size: 20px;
   font-weight: 600;
+  line-height: 1.4;
+  text-align: center;
+  /* 截断兜底:JS 已限定到 MAX_TARGET_CHARS;这里再做一层视觉硬限,最多 2 行 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+  /* 允许字幕条本身被拖动到任意位置 */
+  pointer-events: auto;
+  cursor: grab;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
-/* 译文为空(partial 阶段)时收起译文行,避免留白 */
-#__simul_interpreter_overlay__ .si-target:empty {
-  display: none;
+#__simul_interpreter_overlay__ .si-caption.si-dragging {
+  cursor: grabbing;
+  /* 拖动时让外框略亮一点,暗示「我正在跟手」 */
+  box-shadow: 0 0 0 2px rgba(124, 198, 255, 0.55);
 }
 
-/* 历史(已被新行挤上去的)行整体淡一点,聚焦最新一句 */
-#__simul_interpreter_overlay__ .si-seg:not(:last-child) {
-  opacity: 0.78;
+/* committed / tentative 都继承字幕主色;tentative 半透明 + 斜体表达「还在变」。 */
+#__simul_interpreter_overlay__ .si-committed,
+#__simul_interpreter_overlay__ .si-tentative {
+  color: inherit;
 }
 
-/* partial(中间结果):整段灰显、斜体,弱化未定稿内容 */
-#__simul_interpreter_overlay__ .si-partial {
+#__simul_interpreter_overlay__ .si-tentative {
+  opacity: 0.65;
+  font-style: italic;
+}
+
+#__simul_interpreter_overlay__ .si-tentative:not(:empty)::after {
+  content: "▍";
+  margin-left: 1px;
+  color: inherit;
+  font-style: normal;
   opacity: 0.85;
+  animation: si-caret-blink 1s steps(2, start) infinite;
 }
 
-#__simul_interpreter_overlay__ .si-partial .si-source {
-  font-style: italic;
-}
-
-/* final(定稿):原文弱化、译文为主,形成清晰的双语层次 */
-#__simul_interpreter_overlay__ .si-final .si-source {
-  font-size: 13px;
-  opacity: 0.55;
-}
-
-/* final 但译文尚未回填:显示「翻译中…」占位,做轻微呼吸动画 */
-#__simul_interpreter_overlay__ .si-translating .si-target {
-  color: #cfcfcf;
-  font-style: italic;
-  font-weight: 400;
-  font-size: 16px;
-  animation: si-pulse 1.2s ease-in-out infinite;
-}
-
-@keyframes si-pulse {
-  0%,
-  100% {
-    opacity: 0.45;
-  }
-  50% {
-    opacity: 0.9;
-  }
-}
-
-/* 翻译失败:译文行显示降级提示 */
-#__simul_interpreter_overlay__ .si-error .si-target {
-  color: #ffb4a2;
-  font-size: 14px;
-  font-weight: 400;
-  font-style: italic;
-}
-
-#__simul_interpreter_overlay__ .si-seg {
-  transition: outline-color 0.4s ease, box-shadow 0.4s ease;
-  outline: 2px solid transparent;
-}
-
-/* 被纠错修订的段(ASR 修订重译 / 周期性复审)做短暂高亮提示(里程碑 6) */
-#__simul_interpreter_overlay__ .si-corrected {
-  outline: 2px solid #ffd54f;
-  box-shadow: 0 0 10px rgba(255, 213, 79, 0.55);
-}
-
-/* 纠错时译文做一次轻微的闪现,提示「这句被更新了」 */
-#__simul_interpreter_overlay__ .si-corrected .si-target {
-  animation: si-flash 0.6s ease;
-}
-
-@keyframes si-flash {
-  0% {
-    color: #ffd54f;
-  }
-  100% {
-    color: #fff;
+@keyframes si-caret-blink {
+  to {
+    visibility: hidden;
   }
 }
 
 /* ── 桌宠(可拖动小助手) ───────────────────────────────────────── */
+/* 容器 div 自身永远只占桌宠本体大小(76x76),不被面板撑大。
+   控制面板是 absolute,根据桌宠所在屏幕象限
+   (si-pet-q-tl / tr / bl / br)向远离屏幕边缘的方向展开。
+   这样不管桌宠拖到屏幕哪个角落,展开内容都不会被边缘挡住。 */
 #__simul_interpreter_pet__ {
   position: fixed;
   right: 24px;
   bottom: 20%;
   z-index: 2147483647;
   pointer-events: none; /* 仅桌宠本体可点,不挡页面其它区域 */
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
+  width: 76px;
+  height: 76px;
   font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
   -webkit-user-select: none;
   user-select: none;
@@ -205,46 +172,12 @@
   }
 }
 
-/* 译文气泡 */
-#__simul_interpreter_pet__ .si-pet-bubble {
-  pointer-events: none;
-  position: relative;
-  max-width: 220px;
-  background: #ffffff;
-  color: #1b2433;
-  font-size: 13px;
-  line-height: 1.35;
-  padding: 8px 12px;
-  border-radius: 12px;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22);
-  opacity: 0;
-  transform: translateY(6px) scale(0.96);
-  transition: opacity 0.2s ease, transform 0.2s ease;
-}
-
-#__simul_interpreter_pet__ .si-pet-bubble::after {
-  content: "";
-  position: absolute;
-  left: 50%;
-  bottom: -6px;
-  transform: translateX(-50%);
-  border: 6px solid transparent;
-  border-top-color: #ffffff;
-  border-bottom: 0;
-}
-
-#__simul_interpreter_pet__ .si-pet-bubble.si-show {
-  opacity: 1;
-  transform: translateY(0) scale(1);
-}
-
-#__simul_interpreter_pet__ .si-pet-bubble:empty {
-  display: none;
-}
-
-/* 控制面板:点击桌宠展开 */
+/* 控制面板:absolute 定位,默认(右下象限)位于桌宠正上方右对齐 */
 #__simul_interpreter_pet__ .si-pet-panel {
   display: none;
+  position: absolute;
+  bottom: calc(100% + 6px);
+  right: 0;
   pointer-events: auto;
   flex-direction: column;
   gap: 8px;
@@ -259,6 +192,20 @@
 
 #__simul_interpreter_pet__.si-pet-open .si-pet-panel {
   display: flex;
+}
+
+/* 桌宠在左半边:面板左对齐桌宠 */
+#__simul_interpreter_pet__.si-pet-q-tl .si-pet-panel,
+#__simul_interpreter_pet__.si-pet-q-bl .si-pet-panel {
+  right: auto;
+  left: 0;
+}
+
+/* 桌宠在上半边:面板放到桌宠下方 */
+#__simul_interpreter_pet__.si-pet-q-tl .si-pet-panel,
+#__simul_interpreter_pet__.si-pet-q-tr .si-pet-panel {
+  bottom: auto;
+  top: calc(100% + 6px);
 }
 
 #__simul_interpreter_pet__ .si-pet-title {
@@ -295,16 +242,38 @@
   color: #1b2433;
 }
 
+#__simul_interpreter_pet__ .si-pet-start,
 #__simul_interpreter_pet__ .si-pet-stop {
-  display: none;
   width: 100%;
   padding: 7px;
   border: none;
   border-radius: 6px;
-  background: #c62828;
   color: #fff;
   font-size: 13px;
   cursor: pointer;
+}
+
+/* 默认显示「开始翻译」、隐藏「停止翻译」;运行中反转 */
+#__simul_interpreter_pet__ .si-pet-start {
+  display: block;
+  background: #2e7d32;
+}
+
+#__simul_interpreter_pet__ .si-pet-start:hover {
+  background: #276b29;
+}
+
+#__simul_interpreter_pet__ .si-pet-stop {
+  display: none;
+  background: #c62828;
+}
+
+#__simul_interpreter_pet__ .si-pet-stop:hover {
+  background: #a91d1d;
+}
+
+#__simul_interpreter_pet__.si-pet-running .si-pet-start {
+  display: none;
 }
 
 #__simul_interpreter_pet__.si-pet-running .si-pet-stop {
@@ -352,4 +321,66 @@
 
 #__simul_interpreter_pet__ .si-pet-body {
   position: relative;
+}
+
+/* ── 字幕外观控件(颜色选择 + 重置位置) ───────────────────────────── */
+
+/* 颜色预设按钮 + 自定义颜色一行排开 */
+#__simul_interpreter_pet__ .si-pet-color-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+#__simul_interpreter_pet__ .si-pet-color-preset {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid #d8d8d8;
+  padding: 0;
+  cursor: pointer;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.06);
+}
+
+#__simul_interpreter_pet__ .si-pet-color-preset:hover {
+  border-color: #4a8fe7;
+}
+
+#__simul_interpreter_pet__ .si-pet-color-preset.si-active {
+  border-color: #2b6cb0;
+  box-shadow: 0 0 0 2px rgba(43, 108, 176, 0.25), inset 0 0 0 1px rgba(0, 0, 0, 0.06);
+}
+
+#__simul_interpreter_pet__ .si-pet-color-picker {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+}
+
+#__simul_interpreter_pet__ .si-pet-caption-reset {
+  width: 100%;
+  padding: 6px;
+  border: 1px solid #4a8fe7;
+  border-radius: 6px;
+  background: #fff;
+  color: #2b6cb0;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+#__simul_interpreter_pet__ .si-pet-caption-reset:hover {
+  background: #eef5ff;
+}
+
+/* 「字幕外观」小节标题 */
+#__simul_interpreter_pet__ .si-pet-section {
+  font-size: 11px;
+  color: #888;
+  border-top: 1px solid #eee;
+  padding-top: 8px;
 }

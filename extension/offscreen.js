@@ -185,11 +185,24 @@ async function start(streamId) {
   workletNode.connect(audioContext.destination);
 
   workletNode.port.onmessage = (e) => {
-    // e.data 是一段 16kHz/16bit/单声道 PCM 的 ArrayBuffer。
-    if (wsConnected()) {
-      ws.send(e.data);
+    // worklet 现在发两种消息:
+    //   - ArrayBuffer:一段 16kHz/16bit/单声道 PCM,直接走 WS 上传后端;
+    //   - {type:"vad", event:"silence"|"speech"}:本地 VAD 事件,转给页面字幕层
+    //     立即清屏(完全脱离 ASR 的判停延迟)。
+    if (e.data instanceof ArrayBuffer) {
+      if (wsConnected()) {
+        ws.send(e.data);
+      }
+      // 未连接时直接丢弃,避免积压、保持低延迟。
+      return;
     }
-    // 未连接时直接丢弃,避免积压、保持低延迟。
+    if (e.data && e.data.type === "vad") {
+      sendSubtitleToBackground({
+        channel: "page-subtitle",
+        type: "vad",
+        event: e.data.event, // "silence" | "speech"
+      });
+    }
   };
 
   console.info("[offscreen] 采集已开始", { contextRate: audioContext.sampleRate });

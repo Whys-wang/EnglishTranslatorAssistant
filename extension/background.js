@@ -235,7 +235,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // 来自桌宠 / (兼容)旧 popup 的控制
   if (msg?.target === "background") {
     if (msg.type === "start") {
-      startCapture(msg.tabId, msg.sourceLang, msg.targetLang).then(
+      // 桌宠按钮触发时本身没有 tabId,用 sender.tab.id 当前页;
+      // popup 触发时会显式带上 tabId。
+      const tabId = msg.tabId ?? sender?.tab?.id;
+      if (tabId == null) {
+        sendResponse({ ok: false, error: "找不到当前标签页" });
+        return true;
+      }
+      startCapture(tabId, msg.sourceLang, msg.targetLang).then(
         () => sendResponse({ ok: true }),
         (err) => sendResponse({ ok: false, error: String(err) })
       );
