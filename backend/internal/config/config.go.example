@@ -59,7 +59,7 @@ var ASRRequest = ASRRequestConfig{
 	EnableDDC:      false,
 	ShowUtterances: true,
 	ResultType:     "full",
-	EndWindowSize:  280, // 静音 280ms 即判停:更激进地切句,让 final 译文尽早出来
+	EndWindowSize:  200, // 静音 200ms 即判停:更快把「正在说」的句子定稿,淡色预览更快变实色;过低会把一句切碎,200 是较稳的下限
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -182,7 +182,7 @@ var Translate = TranslateConfig{
 	MaxTokens:          256, // 单句译文足够;上限收紧让生成更快收尾
 	PartialPreview:     true,
 	PartialMinChars:    2,                      // 每多 2 字就送译,边说边译跟得更紧
-	PartialMinInterval: 180 * time.Millisecond, // partial 译文刷新节流间隔
+	PartialMinInterval: 140 * time.Millisecond, // partial 译文刷新节流间隔(缩短:正在说的内容跟得更紧)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -237,8 +237,15 @@ type CorrectionConfig struct {
 	// ReviewInterval 周期性复审的时间间隔(到句子边界或每隔该时间触发一次)。
 	ReviewInterval time.Duration
 
-	// OverwriteOnlyIfMoreConfident 仅当复审结果置信度更高时才覆盖旧译文。
+	// OverwriteOnlyIfMoreConfident 仅当复审「确信改得更准」时才覆盖旧译文。
+	// 开启后,复审返回的每句修订都带一个 confidence(0~1),只有
+	// confidence >= ReviewMinConfidence 且模型确实标记 changed 的句子才会被替换,
+	// 从而避免「把本来正确的句子改成另一种同义说法」的过度纠错(那只会让字幕闪烁)。
 	OverwriteOnlyIfMoreConfident bool
+
+	// ReviewMinConfidence 应用一条复审修订所需的最低置信度(0~1)。
+	// 仅在 OverwriteOnlyIfMoreConfident=true 时生效。调高=更保守,调低=更激进。
+	ReviewMinConfidence float64
 }
 
 // Correction 当前生效的纠错配置(写死的默认值)。
@@ -246,8 +253,9 @@ var Correction = CorrectionConfig{
 	EnableASRRevision:            true,
 	EnablePeriodicReview:         true,
 	ReviewContextWindow:          5,
-	ReviewInterval:               3 * time.Second,
+	ReviewInterval:               1200 * time.Millisecond, // 定时兜底降到 1.2s;主路径是「每句定稿即触发复审」,两者叠加让修订尽快闪现
 	OverwriteOnlyIfMoreConfident: true,
+	ReviewMinConfidence:          0.6,
 }
 
 // ───────────────────────────────────────────────────────────────────────────

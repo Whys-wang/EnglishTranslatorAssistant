@@ -182,10 +182,25 @@ type ReviewItem struct {
 	Target string
 }
 
-// Review 对最近若干句做整体复审纠错:模型可借后文澄清前文的歧义/人名/术语,
-// 返回与输入等长、按顺序排列的「修订后译文」切片(无需修改的句子原样返回)。
-// target 为目标语言(为空回退默认)。
-func (c *Client) Review(ctx context.Context, items []ReviewItem, target string) ([]string, error) {
+// Revision 是复审对一句字幕给出的结构化结果。
+//
+// 相比旧版只返回「修订后译文字符串」,这里额外带上:
+//   - Changed:模型是否真的改了这句(没改就别触发前端「纠错高亮」,避免无谓闪烁);
+//   - Confidence:模型对「这次修改确实更准确」的把握(0~1),
+//     供上层按阈值过滤,杜绝把本来正确的句子越改越糟的「过度纠错」;
+//   - Reason:简短改动理由(便于日志排查,可为空)。
+type Revision struct {
+	Index      int     `json:"index"`
+	Target     string  `json:"target"`
+	Changed    bool    `json:"changed"`
+	Confidence float64 `json:"confidence"`
+	Reason     string  `json:"reason"`
+}
+
+// ReviewDetailed 对最近若干句做整体复审纠错:模型借「完整上下文(尤其后文)」
+// 校正前文的同音误识别、专有名词、代词指代、术语一致性、数字单位、过早翻译造成的
+// 语序错误、一词多义等问题。返回与输入等长、按 index 排序的结构化结果。
+func (c *Client) ReviewDetailed(ctx context.Context, items []ReviewItem, target string) ([]Revision, error) {
 	if len(items) == 0 {
 		return nil, nil
 	}
@@ -218,14 +233,28 @@ func (c *Client) Review(ctx context.Context, items []ReviewItem, target string) 
 	if err != nil {
 		return nil, err
 	}
-	arr, err := parseStringArray(content)
+	revs, err := parseRevisions(content)
 	if err != nil {
 		return nil, err
 	}
-	if len(arr) != len(items) {
-		return nil, fmt.Errorf("review length mismatch: got %d want %d", len(arr), len(items))
+	if len(revs) != len(items) {
+		return nil, fmt.Errorf("review length mismatch: got %d want %d", len(revs), len(items))
 	}
-	return arr, nil
+	return revs, nil
+}
+
+// Review 是 ReviewDetailed 的兼容封装:只返回「修订后译文」切片
+// (无需修改的句子原样返回),保持旧调用方/测试可用。
+func (c *Client) Review(ctx context.Context, items []ReviewItem, target string) ([]string, error) {
+	revs, err := c.ReviewDetailed(ctx, items, target)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, len(revs))
+	for i, r := range revs {
+		out[i] = r.Target
+	}
+	return out, nil
 }
 
 // doChat 执行一次非流式 Chat Completions 调用,返回首个 choice 的文本内容。
@@ -266,34 +295,48 @@ func (c *Client) doChat(ctx context.Context, reqBody chatRequest) (string, error
 	return strings.TrimSpace(cr.Choices[0].Message.Content), nil
 }
 
-// parseStringArray 从模型输出里抽取一个 JSON 字符串数组(容忍 ```json 代码块包裹)。
-func parseStringArray(s string) ([]string, error) {
+// parseRevisions 从模型输出里抽取一个 JSON 对象数组(容忍 ```json 代码块包裹)。
+// 每个对象形如 {index, target, changed, confidence, reason}。
+func parseRevisions(s string) ([]Revision, error) {
 	s = strings.TrimSpace(s)
 	start := strings.IndexByte(s, '[')
 	end := strings.LastIndexByte(s, ']')
 	if start < 0 || end < 0 || end < start {
 		return nil, fmt.Errorf("review: 输出中未找到 JSON 数组 (raw=%s)", s)
 	}
-	var arr []string
-	if err := json.Unmarshal([]byte(s[start:end+1]), &arr); err != nil {
+	var revs []Revision
+	if err := json.Unmarshal([]byte(s[start:end+1]), &revs); err != nil {
 		return nil, fmt.Errorf("review: 解析 JSON 数组失败: %w (raw=%s)", err, s)
 	}
-	return arr, nil
+	return revs, nil
 }
 
 // buildReviewSystemPrompt 组装复审纠错的系统提示词,目标语言为 target(为空回退默认)。
+//
+// 提示词显式列举「实时同传里最常见、且能借后文修正」的错误类型,让模型有的放矢;
+// 并强约束「保守」原则(没问题不要改)+ 结构化输出(带 changed / confidence),
+// 供上层按置信度阈值过滤,避免过度纠错反复改写已经正确的句子。
 func buildReviewSystemPrompt(n int, target string) string {
 	target = resolveTarget(target)
 	var sb strings.Builder
 	sb.WriteString("你是实时同声传译的质检与纠错引擎。用户会给你一个 JSON 数组,按时间先后顺序排列最近几句的 {index, source(原文), target(当前")
 	sb.WriteString(target)
 	sb.WriteString("译文)}。\n")
-	sb.WriteString("请结合【完整上下文】(尤其是后文往往能澄清前文的歧义、人名、术语)逐句校正译文,使整体更准确、连贯、术语一致。要求:\n")
-	sb.WriteString("1. 仅在确有改进时才修改;没有问题的句子原样返回其译文;\n")
-	sb.WriteString("2. 译文须自然流畅、符合")
+	sb.WriteString("请结合【完整上下文】(尤其后文常能澄清前文)逐句判断译文是否有误并校正。重点排查以下错误类型:\n")
+	sb.WriteString("① 同音/谐音误识别:ASR 可能把原文听错(如英文 their/there、中文 期时/其实),若结合上下文明显是另一个词,据此修正译文;\n")
+	sb.WriteString("② 专有名词/人名/地名/产品名:后文出现全称或更清晰写法时,回填修正前文里的音译或错译;\n")
+	sb.WriteString("③ 代词指代:it/they/这/那/他 等在后文明确所指后,修正为更准确的表达;\n")
+	sb.WriteString("④ 术语一致性:同一概念全程使用统一译法(若有术语表必须遵循);\n")
+	sb.WriteString("⑤ 数字/单位/时间/金额/日期:核对是否与原文一致;\n")
+	sb.WriteString("⑥ 过早翻译导致的语序/结构错误:边说边译时前半句可能被误解,后文补全后修正为通顺表达;\n")
+	sb.WriteString("⑦ 一词多义/歧义:后文确定词义后修正(如 Apple 公司 vs 苹果)。\n")
+	sb.WriteString("【保守原则】没有问题的句子一律保持原译文不变、changed 置为 false;只在确有改进时才修改。宁可不改,也不要把已经正确、通顺的句子改成同义的另一种说法(那只会让字幕无谓闪烁)。\n")
+	sb.WriteString("译文须自然流畅、符合")
 	sb.WriteString(target)
-	sb.WriteString("口语习惯,且只对应该句原文,不要合并、拆分或臆测补全;\n")
-	sb.WriteString(fmt.Sprintf("3. 严格只输出一个 JSON 字符串数组,长度必须为 %d,按 index 顺序给出每句修订后的译文,不要输出任何额外文字、键名、序号或注释。", n))
+	sb.WriteString("口语习惯,且只对应该句原文,不要合并、拆分或臆测补全。\n")
+	sb.WriteString(fmt.Sprintf("【输出格式】严格只输出一个 JSON 数组,长度必须为 %d,按 index 升序排列,每个元素是对象:\n", n))
+	sb.WriteString("{\"index\": 该句序号, \"target\": \"修订后译文(没改就原样返回原译文)\", \"changed\": true/false(是否做了实质修改), \"confidence\": 0~1 的数字(你对『本次修改确实更准确』的把握;changed=false 时填 1)}\n")
+	sb.WriteString("不要输出任何额外文字、Markdown 代码块、解释或注释。")
 	writeDomainAndGlossary(&sb)
 	return sb.String()
 }

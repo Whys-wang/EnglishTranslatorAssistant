@@ -40,9 +40,10 @@ type session struct {
 	writeMu sync.Mutex // gorilla 要求同一连接的写操作串行化
 	asr     *asr.Client
 
-	tr        *translate.Client
-	trQueue   chan string // 待翻译的 segment id
-	trEnabled bool        // Ark 是否已配置(未配置则跳过翻译)
+	tr           *translate.Client
+	trQueue      chan string   // 待翻译的 segment id
+	trEnabled    bool          // Ark 是否已配置(未配置则跳过翻译)
+	reviewSignal chan struct{} // 句子边界触发复审的信号(缓冲 1,自动合并)
 
 	tts        *tts.Client
 	ttsQueue   chan ttsJob // 待合成的译文
@@ -86,22 +87,23 @@ type ttsJob struct {
 func newSession(parent context.Context, id string, log *slog.Logger, conn *websocket.Conn) *session {
 	ctx, cancel := context.WithCancel(parent)
 	s := &session{
-		id:         id,
-		log:        log,
-		conn:       conn,
-		ctx:        ctx,
-		cancel:     cancel,
-		tr:         translate.NewClient(log),
-		trQueue:    make(chan string, 64),
-		trEnabled:  translate.Configured(),
-		tts:        tts.NewClient(log),
-		ttsQueue:   make(chan ttsJob, 64),
-		ttsEnabled: tts.Configured(),
-		lastSent:   make(map[string]string),
-		segments:   make(map[string]*segState),
-		lastTTS:    make(map[string]string),
-		partState:  make(map[string]*partialState),
-		tgtLang:    config.TargetLanguage, // 默认目标语言,前端可覆盖
+		id:           id,
+		log:          log,
+		conn:         conn,
+		ctx:          ctx,
+		cancel:       cancel,
+		tr:           translate.NewClient(log),
+		trQueue:      make(chan string, 64),
+		trEnabled:    translate.Configured(),
+		reviewSignal: make(chan struct{}, 1),
+		tts:          tts.NewClient(log),
+		ttsQueue:     make(chan ttsJob, 64),
+		ttsEnabled:   tts.Configured(),
+		lastSent:     make(map[string]string),
+		segments:     make(map[string]*segState),
+		lastTTS:      make(map[string]string),
+		partState:    make(map[string]*partialState),
+		tgtLang:      config.TargetLanguage, // 默认目标语言,前端可覆盖
 	}
 	s.asr = asr.NewClient(id, log, asr.Handlers{
 		OnEvent: s.onASREvent,
@@ -426,6 +428,10 @@ func (s *session) translateSegment(segID string) {
 	s.log.Debug("translation backfilled", slog.String("seg", segID), slog.Bool("corrected", corrected))
 
 	s.enqueueTTS(segID, target, tgtLang)
+
+	// 句子边界:一句刚定稿,立刻触发一次复审,让"用后文纠正前文"的修正尽早闪现,
+	// 而不是干等下一个定时器整点。
+	s.triggerReview()
 }
 
 // enqueueTTS 把一段译文加入语音合成队列(非阻塞,去重)。lang 为目标语言,用于选音色。
@@ -486,7 +492,14 @@ func (s *session) synthesize(job ttsJob) {
 	s.log.Debug("tts audio sent", slog.String("seg", job.segID), slog.Int("bytes", len(audio)))
 }
 
-// reviewLoop 周期性触发 LLM 复审纠错,直到会话结束。
+// reviewLoop 触发 LLM 复审纠错,直到会话结束。两种触发源:
+//   - 句子边界:每当一句定稿翻译完成就立刻复审一次(reviewSignal),
+//     让"用后文纠正前文"的修正尽快出现,不再干等定时器;
+//   - 定时兜底:每隔 ReviewInterval 再扫一次,覆盖久无新句但仍可优化的情况。
+//
+// reviewRecent 内部有窗口指纹去重(lastReviewKey),内容没变不会真正调用 LLM,
+// 而本 loop 是单 goroutine 串行执行,LLM 在途时新信号在缓冲通道里自动合并,
+// 不会刷爆接口。
 func (s *session) reviewLoop() {
 	interval := config.Correction.ReviewInterval
 	if interval <= 0 {
@@ -500,7 +513,20 @@ func (s *session) reviewLoop() {
 			return
 		case <-ticker.C:
 			s.reviewRecent()
+		case <-s.reviewSignal:
+			s.reviewRecent()
 		}
+	}
+}
+
+// triggerReview 在句子边界请求一次尽快的复审(非阻塞;已有待处理信号则合并)。
+func (s *session) triggerReview() {
+	if !config.Correction.EnablePeriodicReview {
+		return
+	}
+	select {
+	case s.reviewSignal <- struct{}{}:
+	default: // 已有待处理信号,合并即可
 	}
 }
 
@@ -549,7 +575,7 @@ func (s *session) reviewRecent() {
 	s.segMu.Unlock()
 
 	_, tgtLang := s.languages()
-	revised, err := s.tr.Review(s.ctx, items, tgtLang)
+	revised, err := s.tr.ReviewDetailed(s.ctx, items, tgtLang)
 	if err != nil {
 		s.log.Debug("review failed", slog.String("err", err.Error()))
 		return
@@ -558,10 +584,21 @@ func (s *session) reviewRecent() {
 		return
 	}
 
-	// 3) 仅覆盖确有改动、且自快照以来未被更新过的 segment。
+	// 3) 仅覆盖「模型确实改了、置信度达标、且自快照以来未被更新过」的 segment。
+	//    置信度门槛杜绝过度纠错:把本来正确的句子改成另一种同义说法只会让字幕闪烁。
+	minConf := config.Correction.ReviewMinConfidence
+	gateOnConfidence := config.Correction.OverwriteOnlyIfMoreConfident
 	for i, id := range ids {
-		newTarget := strings.TrimSpace(revised[i])
-		if newTarget == "" || newTarget == tgtSnap[i] {
+		rev := revised[i]
+		newTarget := strings.TrimSpace(rev.Target)
+		// 模型没标记改动、译文为空、或与旧译文一致 -> 跳过(不触发前端纠错高亮)。
+		if !rev.Changed || newTarget == "" || newTarget == tgtSnap[i] {
+			continue
+		}
+		// 置信度门槛:开启后,低于阈值的修订一律不采纳(宁可不改也不乱改)。
+		if gateOnConfidence && rev.Confidence < minConf {
+			s.log.Debug("review skipped: low confidence",
+				slog.String("seg", id), slog.Float64("confidence", rev.Confidence))
 			continue
 		}
 		s.segMu.Lock()
@@ -584,7 +621,10 @@ func (s *session) reviewRecent() {
 			"end_time":   end,
 			"corrected":  true,
 		})
-		s.log.Debug("review corrected", slog.String("seg", id))
+		s.log.Debug("review corrected",
+			slog.String("seg", id),
+			slog.Float64("confidence", rev.Confidence),
+			slog.String("reason", rev.Reason))
 		s.enqueueTTS(id, newTarget, tgtLang)
 	}
 }

@@ -1,31 +1,38 @@
 /* overlay.css —— 流式字幕条样式
  *
- * 借鉴 Google Live Caption / Apple Live Captions:屏幕底部一条固定的字幕条,
- * 内容像打字机一样持续追加,永不主动消失。
+ * 借鉴 YouTube / 系统实时字幕:屏幕底部一条固定的字幕条,左对齐、自然换行、
+ * 固定 2 行高度 + 底部锚定竖直滚动(JS 把 scrollTop 锁在底部),文字只在末尾追加、
+ * 不左右横移,旧内容向上滚出视野。
  *   - .si-committed:已定稿(final)部分,饱满白色;
  *   - .si-tentative:当前说话中(partial)部分,接在末尾,略微弱化提示"还在变";
- *   - JS 已对总长做了滑动窗口截断(MAX_TARGET_CHARS),CSS 再用 line-clamp
- *     兜底,确保任何情况下都不会撑高超过 2 行。
+ *   - .si-corrected:刚被自动纠正(ASR 修订 / LLM 复审)的那一段,短暂淡出高亮。
  */
 
 #__simul_interpreter_overlay__ {
   position: fixed;
-  left: 50%;
   bottom: 8%;
-  transform: translateX(-50%);
+  /* 居中但不依赖 left:50%:用 left:0/right:0 + margin:auto 居中,
+     这样盒子的「可用宽度」不随位置变化。 */
+  left: 0;
+  right: 0;
+  margin: 0 auto;
   z-index: 2147483647;
-  max-width: 86vw;
+  /* 固定宽度(不随内容增减):盒子不会再随字数变化重新居中,文字也就不会左右横移;
+     长字幕在这个固定宽度内稳定换行,拖动后格式完全一致。 */
+  width: min(680px, 88vw);
   pointer-events: none;
   font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
   /* 字幕主色:外层 CSS 变量,桌宠面板的颜色选择会写到 overlay.style 上 */
   --si-caption-color: #ffffff;
 }
 
-/* 用户手动拖动过位置时,清掉默认的「底部居中」锚定,改用 left/top 直接定位 */
+/* 用户手动拖动过位置时,改用 left/top 直接定位(不再居中),但宽度规则不变,
+   所以换行格式与居中时完全一致。 */
 #__simul_interpreter_overlay__.si-positioned {
-  left: 0;
+  left: 0; /* 实际位置由 inline left/top 覆盖 */
+  right: auto;
+  margin: 0;
   bottom: auto;
-  transform: none;
 }
 
 /* 无内容时整条隐藏(避免显示一个黑色空条) */
@@ -41,11 +48,11 @@
   font-size: 20px;
   font-weight: 600;
   line-height: 1.4;
-  text-align: center;
-  /* 截断兜底:JS 已限定到 MAX_TARGET_CHARS;这里再做一层视觉硬限,最多 2 行 */
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+  /* 左对齐 + 底部锚定竖直滚动:文字只在末尾追加、不再随长度变化左右横移;
+     固定为 2 行高度,超出的旧内容向上滚出(JS 把 scrollTop 锁在底部显示最新两行)。
+     这样阅读位置稳定,不会「读到一半被挤到下一行 / 找不到了」。 */
+  text-align: left;
+  max-height: 2.8em; /* 2 行 × line-height 1.4 */
   overflow: hidden;
   word-break: break-word;
   /* 允许字幕条本身被拖动到任意位置 */
@@ -60,6 +67,44 @@
   cursor: grabbing;
   /* 拖动时让外框略亮一点,暗示「我正在跟手」 */
   box-shadow: 0 0 0 2px rgba(124, 198, 255, 0.55);
+}
+
+/* 字幕右上角的锁图标:点一下锁定拖动,再点解锁 */
+#__simul_interpreter_overlay__ .si-caption-lock {
+  position: absolute;
+  top: -10px;
+  right: -10px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.82);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  pointer-events: auto;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+  opacity: 0.5;
+  transition: opacity 120ms ease, background 120ms ease, color 120ms ease;
+}
+
+#__simul_interpreter_overlay__ .si-caption-lock:hover {
+  opacity: 1;
+}
+
+/* 已锁定:图标更醒目(绿色实心),一眼能看出当前是锁住的 */
+#__simul_interpreter_overlay__ .si-caption-lock.si-locked-on {
+  opacity: 0.95;
+  background: rgba(86, 214, 132, 0.95);
+  color: #06210f;
+}
+
+/* 锁定时字幕不再显示「可抓取」光标 */
+#__simul_interpreter_overlay__ .si-caption.si-locked {
+  cursor: default;
 }
 
 /* committed / tentative 都继承字幕主色;tentative 半透明 + 斜体表达「还在变」。 */
@@ -80,6 +125,14 @@
   font-style: normal;
   opacity: 0.85;
   animation: si-caret-blink 1s steps(2, start) infinite;
+}
+
+/* 刚被自动纠正的句子:JS 按淡出强度把底色写到 style.backgroundColor 上,
+ * 这里只负责把高亮做成一个圆角小药丸,并让相邻两帧的色值过渡得更顺滑。 */
+#__simul_interpreter_overlay__ .si-corrected {
+  border-radius: 5px;
+  padding: 0 3px;
+  transition: background-color 90ms linear;
 }
 
 @keyframes si-caret-blink {
