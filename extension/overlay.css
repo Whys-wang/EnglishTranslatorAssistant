@@ -49,11 +49,15 @@
   font-weight: 600;
   line-height: 1.4;
   /* 左对齐 + 底部锚定竖直滚动:文字只在末尾追加、不再随长度变化左右横移;
-     固定为 2 行高度,超出的旧内容向上滚出(JS 把 scrollTop 锁在底部显示最新两行)。
-     这样阅读位置稳定,不会「读到一半被挤到下一行 / 找不到了」。 */
+     固定为 2 行高度,超出的旧内容向上滚出(JS 默认把 scrollTop 锁在底部显示最新两行)。
+     overflow-y:auto 允许用户在框内上下滚动,回看以前的译文;overscroll-behavior:contain
+     避免滚到顶/底时带动整页滚动。 */
   text-align: left;
   max-height: 2.8em; /* 2 行 × line-height 1.4 */
-  overflow: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin; /* Firefox 细滚动条 */
+  scrollbar-color: rgba(255, 255, 255, 0.4) transparent;
   word-break: break-word;
   /* 允许字幕条本身被拖动到任意位置 */
   pointer-events: auto;
@@ -61,6 +65,18 @@
   touch-action: none;
   -webkit-user-select: none;
   user-select: none;
+}
+
+/* WebKit(Chrome/Edge)细滚动条:半透明,不抢戏 */
+#__simul_interpreter_overlay__ .si-caption::-webkit-scrollbar {
+  width: 6px;
+}
+#__simul_interpreter_overlay__ .si-caption::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.4);
+  border-radius: 3px;
+}
+#__simul_interpreter_overlay__ .si-caption::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 #__simul_interpreter_overlay__ .si-caption.si-dragging {

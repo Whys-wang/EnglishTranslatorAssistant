@@ -115,6 +115,10 @@
   let flashTimer = null;
   let lastCorrectionShownAt = 0;
 
+  // 是否「粘底」:true=自动停在最新两行(默认);用户向上滚动看历史时变 false,
+  // 此时不再自动拽回底部、也暂停静音清屏,滚回底部后恢复。
+  let stickToBottom = true;
+
   // 字幕外观偏好:用户拖到哪 / 颜色选的什么,都会持久化到 chrome.storage.local。
   // captionPos 为 null 时表示用默认「底部居中」(由 CSS 控制)。
   let captionPos = null; // {left:number, top:number} 或 null
@@ -126,14 +130,23 @@
     if (el) return el;
     el = document.createElement("div");
     el.id = OVERLAY_ID;
-    // 单条字幕条:committed 部分(已定稿,全色)与 tentative 部分(说话中,略淡)
-    // 分两个 span,视觉上区分稳定与不稳定,但都在同一行内随末尾流动。
+    // 字幕条 + 右上角锁图标。初始 span 占位,render 会按分段重建内容。
     el.innerHTML = `<div class="si-caption"><span class="si-committed"></span><span class="si-tentative"></span></div><button class="si-caption-lock" type="button"></button>`;
     document.documentElement.appendChild(el);
     applyCaptionPos(el);
     applyCaptionColor(el);
     applyCaptionLock(el);
     makeCaptionDraggable(el);
+
+    // 滚动监听:判断用户是否在底部附近。滚到底=粘底(自动跟最新);
+    // 向上滚=查看历史,暂停自动跟随与静音清屏。
+    const captionEl = el.querySelector(".si-caption");
+    if (captionEl) {
+      captionEl.addEventListener("scroll", () => {
+        stickToBottom =
+          captionEl.scrollHeight - captionEl.scrollTop - captionEl.clientHeight < 24;
+      });
+    }
 
     // 锁图标:点击切换锁定/解锁并持久化;阻止冒泡,避免被拖动逻辑吞掉。
     const lockBtn = el.querySelector(".si-caption-lock");
@@ -159,6 +172,7 @@
     clearedIds.clear();
     correctedAt.clear();
     lastCorrectionShownAt = 0;
+    stickToBottom = true;
     if (flashTimer) {
       clearTimeout(flashTimer);
       flashTimer = null;
@@ -273,6 +287,8 @@
 
     caption.addEventListener("pointerdown", (e) => {
       if (captionLocked) return; // 已锁定:禁止拖动
+      // 点在右侧滚动条上时不拖动,交给原生滚动(clientWidth 不含滚动条宽度)。
+      if (e.offsetX > caption.clientWidth) return;
       dragging = true;
       moved = false;
       startX = e.clientX;
@@ -389,6 +405,8 @@
     const caption = overlay.querySelector(".si-caption");
     if (!caption) return;
     const now = Date.now();
+    // 记录重建前的滚动位置:用户在看历史(未粘底)时,重建后要还原,不能跳。
+    const prevScrollTop = caption.scrollTop;
 
     const pieces = buildPieces();
 
@@ -415,8 +433,13 @@
 
     // 字幕条整体可见性:有任何内容才显示,完全没有就隐藏(避免空黑条)。
     overlay.classList.toggle("si-empty", pieces.length === 0);
-    // 底部锚定:把滚动停在最底,始终显示最新两行(旧内容向上滚出,绝不左右横移)。
-    caption.scrollTop = caption.scrollHeight;
+    // 粘底时停在最底显示最新两行;用户在看历史(未粘底)时,还原其滚动位置,
+    // 不被新字幕拽回底部(内容是向末尾追加的,顶部稳定,还原位置即可保持视图)。
+    if (stickToBottom) {
+      caption.scrollTop = caption.scrollHeight;
+    } else {
+      caption.scrollTop = prevScrollTop;
+    }
 
     // 清理过期高亮记录,避免 Map 无限增长。
     if (correctedAt.size) {
@@ -454,6 +477,8 @@
   function clearCaptionOnSilence() {
     if (!running) return;
     if (finals.size === 0 && !tentative.target) return;
+    // 用户正在向上滚动看历史译文:暂停清屏,免得正读着就被清空。
+    if (!stickToBottom) return;
     const now = Date.now();
     if (!lastActivityAt || now - lastActivityAt < CLEAR_AFTER_SILENCE_MS) return;
     // 刚有过纠正:在高亮淡出 + 一段可读时间内不清屏,避免「闪一下就消失」。
