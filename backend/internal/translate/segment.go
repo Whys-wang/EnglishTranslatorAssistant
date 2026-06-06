@@ -58,13 +58,39 @@ func SegmentPolicyFor(source, srcLang string) StreamSegmentPolicy {
 			DisableClauseFlush: true,
 		}
 	case "俄语":
+		// 俄语→中:整句单条 + 预览秒升 + 后台精修(与英/日/韩隔离)。
 		return StreamSegmentPolicy{
-			MinRunes: 18, MaxRunes: 0, PartialMinTail: 20,
+			MinRunes: 16, MaxRunes: 0,
+			PartialMinTail: 10, PartialMinChars: 3,
+			PartialMinInterval: 90 * time.Millisecond,
+			PartialPromoteWait: 450 * time.Millisecond,
+			PartialCancelGrow:  2,
+			PromotePartialOnFinal: true,
 			AllowWeakSplit: false, AllowSpaceSplit: true,
 			DisableClauseFlush: true,
 		}
-	case "法语", "德语", "西班牙语", "英语":
-		// 英语等:保持用户验证过的「完美」参数,不跟 CJK 优化混用。
+	case "法语", "德语":
+		// 法/德→中:整句单条,预览跟嘴,定稿秒升后 Pro 精修。
+		return StreamSegmentPolicy{
+			MinRunes: 18, MaxRunes: 0,
+			PartialMinTail: 12, PartialMinChars: 4,
+			PartialMinInterval: 100 * time.Millisecond,
+			PartialPromoteWait: 420 * time.Millisecond,
+			PartialCancelGrow:  2,
+			PromotePartialOnFinal: true,
+			AllowWeakSplit: false, AllowSpaceSplit: true,
+			DisableClauseFlush: true,
+		}
+	case "英语":
+		// 英→中:已验收,勿改。
+		return StreamSegmentPolicy{
+			MinRunes: 20, MaxRunes: 0, PartialMinTail: 20,
+			PartialMinChars: 10, PartialMinInterval: 250 * time.Millisecond,
+			AllowWeakSplit: false, AllowSpaceSplit: true,
+			DisableClauseFlush: true,
+		}
+	case "西班牙语":
+		// 西语暂沿用旧欧美默认,与英/法/德/俄优化隔离。
 		return StreamSegmentPolicy{
 			MinRunes: 20, MaxRunes: 0, PartialMinTail: 20,
 			PartialMinChars: 10, PartialMinInterval: 250 * time.Millisecond,

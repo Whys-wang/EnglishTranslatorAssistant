@@ -111,10 +111,13 @@ func ASRNeedsNostream(srcLang string) bool {
 	return !ASRUsesAsyncDefault(srcLang)
 }
 
-// ASREndWindowSize 返回 ASR 判停(ms)。仅日语使用更短窗口以加快定稿,其余语种不变。
+// ASREndWindowSize 返回 ASR 判停(ms)。仅对指定语种微调;英/韩/中等其余语种走 config 默认。
 func ASREndWindowSize(srcLang string) int {
-	if NormalizeLang(srcLang) == "日语" {
+	switch NormalizeLang(srcLang) {
+	case "日语":
 		return 75
+	case "法语", "德语", "俄语":
+		return 82
 	}
 	if ASRNeedsNostream(srcLang) {
 		if config.ASRRequest.EndWindowSizeNostream > 0 {

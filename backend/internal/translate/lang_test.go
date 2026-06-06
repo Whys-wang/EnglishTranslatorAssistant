@@ -91,6 +91,15 @@ func TestASREndWindowSizeJapaneseOnly(t *testing.T) {
 	if got := ASREndWindowSize("日语"); got != 75 {
 		t.Fatalf("日语 end_window=%d, want 75", got)
 	}
+	if got := ASREndWindowSize("法语"); got != 82 {
+		t.Fatalf("法语 end_window=%d, want 82", got)
+	}
+	if got := ASREndWindowSize("德语"); got != 82 {
+		t.Fatalf("德语 end_window=%d, want 82", got)
+	}
+	if got := ASREndWindowSize("俄语"); got != 82 {
+		t.Fatalf("俄语 end_window=%d, want 82", got)
+	}
 	ko := ASREndWindowSize("韩语")
 	if ko != config.ASRRequest.EndWindowSizeNostream {
 		t.Fatalf("韩语 end_window=%d, want nostream default %d", ko, config.ASRRequest.EndWindowSizeNostream)

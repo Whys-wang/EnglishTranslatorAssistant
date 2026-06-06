@@ -1,6 +1,9 @@
 package translate
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestSegmentPolicyEnglishNoMidSplit(t *testing.T) {
 	p := SegmentPolicyFor("Good morning everyone, today we talk.", "英语")
@@ -42,6 +45,13 @@ func TestSegmentPolicyJapaneseNoMidSplit(t *testing.T) {
 	}
 }
 
+func TestSegmentPolicyKoreanUnchanged(t *testing.T) {
+	p := SegmentPolicyFor("안녕하세요", "韩语")
+	if !p.PromotePartialOnFinal || p.PartialMinInterval != 60*time.Millisecond {
+		t.Fatalf("韩语 policy changed unexpectedly: %+v", p)
+	}
+}
+
 func TestDetectPrimaryLanguage(t *testing.T) {
 	if got := DetectPrimaryLanguage("皆さんこんにちは"); got != "日语" && got != "中文" {
 		// 纯汉字可能被标为中文;含假名时应为日语
@@ -54,6 +64,18 @@ func TestDetectPrimaryLanguage(t *testing.T) {
 	}
 	if got := DetectPrimaryLanguage("Привет мир"); got != "俄语" {
 		t.Fatalf("cyrillic => %q", got)
+	}
+}
+
+func TestSegmentPolicyEuropeanPromote(t *testing.T) {
+	for _, lang := range []string{"法语", "德语", "俄语"} {
+		p := SegmentPolicyFor("test source text here.", lang)
+		if !p.DisableClauseFlush || !p.PromotePartialOnFinal {
+			t.Fatalf("%s should use single-line + promote, got %+v", lang, p)
+		}
+		if p.PartialMinTail >= 20 {
+			t.Fatalf("%s partial tail too high: %d", lang, p.PartialMinTail)
+		}
 	}
 }
 

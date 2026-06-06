@@ -221,8 +221,12 @@ func streamSubtitleHint(sourceLang string) string {
 	case "韩语":
 		return "韩语口译,自然口语,只译字幕不解释。"
 	case "俄语":
-		return "俄语口译,完整语义,只译字幕不解释。"
-	case "法语", "德语", "西班牙语":
+		return "俄语口译,完整句意,自然中文,只译字幕不解释。"
+	case "法语":
+		return "法语口译,完整句意,自然中文,只译字幕不解释。"
+	case "德语":
+		return "德语口译,完整句意,自然中文,只译字幕不解释。"
+	case "西班牙语":
 		return "口译完整句意,只译字幕不解释。"
 	case "中文", "粤语":
 		return "中文口译,通顺口语,只译字幕不解释。"
