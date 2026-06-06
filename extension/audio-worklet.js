@@ -12,7 +12,7 @@
 //     立刻让字幕谢幕,完全跳过 ASR 200-400ms 的内部判停延迟。
 
 const TARGET_RATE = 16000;
-const CHUNK_MS = 100;
+const CHUNK_MS = 20;
 const CHUNK_SAMPLES = (TARGET_RATE * CHUNK_MS) / 1000; // 1600
 
 // VAD 阈值:本分片的 RMS(归一化到 [0,1])低于此值视为「无声」。

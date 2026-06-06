@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"simul-interpreter/internal/config"
+	"simul-interpreter/internal/translate"
 )
 
 // Utterance 是一句识别结果。
@@ -55,8 +57,12 @@ type Client struct {
 	log       *slog.Logger
 	h         Handlers
 
-	mu   sync.Mutex      // 保护 conn 写入与重连
-	conn *websocket.Conn // 当前上游连接(可能在重连期间为 nil)
+	mu          sync.Mutex      // 保护 conn 写入与重连
+	conn        *websocket.Conn // 当前上游连接(可能在重连期间为 nil)
+	srcLang     string          // 用户源语言(规范名,空=自动检测)
+	language    string          // audio.language,空=默认中英文模型
+	useNostream bool            // 是否走 bigmodel_nostream(小语种)
+	connectGen  uint64          // 语言切换时递增,丢弃过期的连接建立
 
 	closed bool
 }
@@ -64,6 +70,53 @@ type Client struct {
 // NewClient 创建一个 ASR 客户端。
 func NewClient(sessionID string, log *slog.Logger, h Handlers) *Client {
 	return &Client{sessionID: sessionID, log: log, h: h}
+}
+
+// SetSourceLanguage 按源语言选择 ASR 端点与 audio.language。
+// 英语/中文/自动检测走 bigmodel_async(英→中同款);其余显式源语言走 nostream + 语种代码。
+func (c *Client) SetSourceLanguage(srcLang string) {
+	src := translate.NormalizeLang(srcLang)
+	useNostream := translate.ASRNeedsNostream(src)
+	langCode := ""
+	if useNostream {
+		langCode = translate.ASRLanguageCode(src)
+	}
+
+	c.mu.Lock()
+	if c.language == langCode && c.useNostream == useNostream {
+		c.srcLang = src
+		c.mu.Unlock()
+		return
+	}
+	c.srcLang = src
+	c.language = langCode
+	c.useNostream = useNostream
+	c.connectGen++
+	conn := c.conn
+	c.conn = nil
+	gen := c.connectGen
+	c.mu.Unlock()
+
+	if conn != nil {
+		_ = conn.Close()
+	}
+	c.log.Info("asr language configured",
+		slog.String("session", c.sessionID),
+		slog.String("source", src),
+		slog.String("language", langCode),
+		slog.Bool("nostream", useNostream),
+		slog.Uint64("connect_gen", gen),
+	)
+}
+
+func (c *Client) endpointLocked() string {
+	if c.useNostream {
+		return config.ASRWebSocketURLNostream
+	}
+	if config.ASRWebSocketURLAsync != "" {
+		return config.ASRWebSocketURLAsync
+	}
+	return config.ASRWebSocketURL
 }
 
 // buildConfigJSON 组装 full client request 的 JSON 配置。
@@ -76,18 +129,37 @@ func (c *Client) buildConfigJSON() ([]byte, error) {
 		"show_utterances": config.ASRRequest.ShowUtterances,
 		"result_type":     config.ASRRequest.ResultType,
 	}
-	if config.ASRRequest.EndWindowSize > 0 {
-		req["end_window_size"] = config.ASRRequest.EndWindowSize
+	c.mu.Lock()
+	useNostream := c.useNostream
+	c.mu.Unlock()
+	if useNostream {
+		if sz := translate.ASREndWindowSize(c.srcLang); sz > 0 {
+			req["end_window_size"] = sz
+		}
+	} else {
+		if config.ASRRequest.EndWindowSize > 0 {
+			req["end_window_size"] = config.ASRRequest.EndWindowSize
+		}
+		if config.ASRRequest.EnableNonstream {
+			req["enable_nonstream"] = true
+		}
+	}
+	audio := map[string]any{
+		"format":  "pcm",
+		"codec":   "raw",
+		"rate":    config.AudioSampleRate,
+		"bits":    config.AudioBitDepth,
+		"channel": config.AudioChannels,
+	}
+	c.mu.Lock()
+	lang := c.language
+	c.mu.Unlock()
+	if lang != "" {
+		audio["language"] = lang
 	}
 	payload := map[string]any{
-		"user": map[string]any{"uid": c.sessionID},
-		"audio": map[string]any{
-			"format":  "pcm",
-			"codec":   "raw",
-			"rate":    config.AudioSampleRate,
-			"bits":    config.AudioBitDepth,
-			"channel": config.AudioChannels,
-		},
+		"user":    map[string]any{"uid": c.sessionID},
+		"audio":   audio,
 		"request": req,
 	}
 	return json.Marshal(payload)
@@ -95,12 +167,15 @@ func (c *Client) buildConfigJSON() ([]byte, error) {
 
 // dialAndInit 建立上游连接并发送首包配置。
 func (c *Client) dialAndInit(ctx context.Context) error {
+	c.mu.Lock()
+	gen := c.connectGen
+	endpoint := c.endpointLocked()
+	c.mu.Unlock()
+
 	header := http.Header{}
 	if config.UseNewConsoleAuth {
-		// 新版控制台:仅需 X-Api-Key。
 		header.Set("X-Api-Key", config.SpeechAPIKey)
 	} else {
-		// 旧版控制台:App Key + Access Key。
 		header.Set("X-Api-App-Key", config.ASRAppKey)
 		header.Set("X-Api-Access-Key", config.ASRAccessKey)
 	}
@@ -110,13 +185,22 @@ func (c *Client) dialAndInit(ctx context.Context) error {
 	header.Set("X-Api-Sequence", "-1")
 
 	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
-	conn, resp, err := dialer.DialContext(ctx, config.ASRWebSocketURL, header)
+	conn, resp, err := dialer.DialContext(ctx, endpoint, header)
 	if err != nil {
 		if resp != nil {
 			return fmt.Errorf("dial asr (http %d, logid=%s): %w", resp.StatusCode, resp.Header.Get("X-Tt-Logid"), err)
 		}
 		return fmt.Errorf("dial asr: %w", err)
 	}
+
+	c.mu.Lock()
+	if c.connectGen != gen || c.closed {
+		c.mu.Unlock()
+		_ = conn.Close()
+		return fmt.Errorf("asr connect stale (gen=%d)", gen)
+	}
+	c.mu.Unlock()
+
 	if c.h.OnLogid != nil {
 		c.h.OnLogid(resp.Header.Get("X-Tt-Logid"))
 	}
@@ -137,6 +221,11 @@ func (c *Client) dialAndInit(ctx context.Context) error {
 	}
 
 	c.mu.Lock()
+	if c.connectGen != gen || c.closed {
+		c.mu.Unlock()
+		_ = conn.Close()
+		return fmt.Errorf("asr connect stale after init (gen=%d)", gen)
+	}
 	c.conn = conn
 	c.mu.Unlock()
 	return nil
@@ -157,12 +246,28 @@ func (c *Client) Run(ctx context.Context) {
 		}
 
 		if err := c.dialAndInit(ctx); err != nil {
+			if strings.Contains(err.Error(), "stale") {
+				c.log.Debug("asr connect superseded", slog.String("err", err.Error()))
+				backoff = config.Reconnect.InitialBackoff
+				attempt = 0
+				continue
+			}
 			c.emitErr(fmt.Errorf("asr connect: %w", err))
 		} else {
-			c.log.Info("asr upstream connected", slog.String("session", c.sessionID))
+			c.mu.Lock()
+			endpoint := c.endpointLocked()
+			src := c.srcLang
+			lang := c.language
+			c.mu.Unlock()
+			c.log.Info("asr upstream connected",
+				slog.String("session", c.sessionID),
+				slog.String("endpoint", endpoint),
+				slog.String("source", src),
+				slog.String("language", lang),
+			)
 			backoff = config.Reconnect.InitialBackoff
 			attempt = 0
-			c.readLoop(ctx) // 阻塞直到读出错或连接关闭
+			c.readLoop(ctx)
 			c.clearConn()
 		}
 

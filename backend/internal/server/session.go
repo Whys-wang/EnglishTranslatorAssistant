@@ -58,6 +58,11 @@ type session struct {
 	tgtLang string
 	langGen uint64 // 每次变更语言 +1,用于丢弃切换前已在途的译文
 
+	// ASR 分句 -> 稳定 segment_id(避免 start_time 重复时覆盖上一句字幕)。
+	asrSegMu      sync.Mutex
+	asrSegSeq     int
+	asrSegByStart map[int]*asrSegBind
+
 	// 记录每个 segment 上一次下发的原文,用于去重(避免无变化的重复推送)。
 	segMu         sync.Mutex
 	lastSent      map[string]string
@@ -69,13 +74,32 @@ type session struct {
 	// 边说边译:对说话中(partial)的句子做节流翻译的状态。
 	partMu    sync.Mutex
 	partState map[string]*partialState
+
+	// 字幕去重:短时间内相同译文不重复上屏(避免 partial/小句切分重叠)。
+	subDedupMu    sync.Mutex
+	lastSubTarget string
+	lastSubAt     time.Time
+}
+
+// asrSegBind 把 ASR start_time 绑定到会话内单调递增的 segment id。
+type asrSegBind struct {
+	id       string
+	definite bool
 }
 
 // partialState 记录某句「说话中」的实时翻译节流状态。
 type partialState struct {
-	lastSource string    // 上次送去翻译的原文(用于判断增量)
-	lastAt     time.Time // 上次送去翻译的时间(用于限频)
-	inflight   bool      // 是否已有一次 partial 翻译在途(同句串行,天然限流)
+	lastSource       string
+	lastTarget       string
+	lastAt           time.Time
+	inflight         bool
+	pendingSource    string
+	lastPushedTarget string
+	cancel           context.CancelFunc
+	lockedSource     string // 已切分上屏的小句原文前缀
+	clauseSeq        int
+	lastClauseSource string // 上一段已上屏小句原文(给下一段当上下文)
+	lastClauseTarget string // 上一段已上屏小句译文
 }
 
 // ttsJob 是一条待合成的译文任务。
@@ -104,6 +128,7 @@ func newSession(parent context.Context, id string, log *slog.Logger, conn *webso
 		segments:     make(map[string]*segState),
 		lastTTS:      make(map[string]string),
 		partState:    make(map[string]*partialState),
+		asrSegByStart: make(map[int]*asrSegBind),
 		tgtLang:      config.TargetLanguage, // 默认目标语言,前端可覆盖
 	}
 	s.asr = asr.NewClient(id, log, asr.Handlers{
@@ -127,10 +152,16 @@ func (s *session) setLanguages(src, tgt string) {
 	}
 
 	s.langMu.Lock()
+	oldSrc := s.srcLang
 	changed := newSrc != s.srcLang || newTgt != s.tgtLang
 	s.srcLang = newSrc
 	s.tgtLang = newTgt
 	s.langMu.Unlock()
+
+	// 源语言变化时同步 ASR 路由:英/中/自动→async;其他语种→nostream+language。
+	if newSrc != oldSrc {
+		s.asr.SetSourceLanguage(newSrc)
+	}
 
 	if changed {
 		s.bumpLangGen()
@@ -203,6 +234,10 @@ func (s *session) resetTranslationState() {
 	s.partMu.Lock()
 	s.partState = make(map[string]*partialState)
 	s.partMu.Unlock()
+
+	s.asrSegMu.Lock()
+	s.asrSegByStart = make(map[int]*asrSegBind)
+	s.asrSegMu.Unlock()
 }
 
 // languages 返回当前的源语言提示与目标语言。
@@ -216,7 +251,14 @@ func (s *session) languages() (src, tgt string) {
 func (s *session) start() {
 	go s.asr.Run(s.ctx)
 	if s.trEnabled {
-		go s.translateLoop()
+		go func() { s.tr.Prewarm(s.ctx) }()
+		workers := config.Translate.FinalWorkers
+		if workers < 1 {
+			workers = 1
+		}
+		for i := 0; i < workers; i++ {
+			go s.translateLoop()
+		}
 		// 纠错第二层:周期性 LLM 复审(用后文校正前文)。
 		if config.Correction.EnablePeriodicReview {
 			go s.reviewLoop()
@@ -258,15 +300,55 @@ func (s *session) writeJSON(v any) {
 	}
 }
 
+// writeSubtitle 下发字幕;过滤空译文,并抑制 3 秒内完全相同的重复行。
+func (s *session) writeSubtitle(v map[string]any) {
+	target, _ := v["target"].(string)
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return
+	}
+	v["target"] = target
+	status, _ := v["status"].(string)
+	// 只抑制 partial 之间的重复刷屏;定稿 final 必须下发(哪怕与预览相同)。
+	if status == "partial" {
+		s.subDedupMu.Lock()
+		if target == s.lastSubTarget && time.Since(s.lastSubAt) < 3*time.Second {
+			s.subDedupMu.Unlock()
+			return
+		}
+		s.lastSubTarget = target
+		s.lastSubAt = time.Now()
+		s.subDedupMu.Unlock()
+	}
+	s.writeJSON(v)
+}
+
+// asrSegmentID 为 ASR 分句分配稳定的 segment_id。
+// 同一句 partial/final 共用 id;上一句定稿后即使 start_time 重复也分配新 id,避免覆盖滚动历史。
+func (s *session) asrSegmentID(u asr.Utterance) string {
+	s.asrSegMu.Lock()
+	defer s.asrSegMu.Unlock()
+
+	bind, ok := s.asrSegByStart[u.StartTime]
+	if !ok || (bind.definite && !u.Definite) {
+		s.asrSegSeq++
+		id := fmt.Sprintf("seg-%d", s.asrSegSeq)
+		s.asrSegByStart[u.StartTime] = &asrSegBind{id: id, definite: u.Definite}
+		return id
+	}
+	if u.Definite {
+		bind.definite = true
+	}
+	return bind.id
+}
+
 // onASREvent 把 ASR 分句结果映射为字幕事件回发前端,并对定稿分句触发翻译。
 func (s *session) onASREvent(ev asr.Event) {
 	for _, u := range ev.Utterances {
 		if u.Text == "" {
 			continue
 		}
-		// 用 start_time 作为稳定的 segment_id:同一句在多次返回间保持一致,
-		// 文本变化即原地更新(体现 partial->final 与服务端修订)。
-		segID := fmt.Sprintf("seg-%d", u.StartTime)
+		segID := s.asrSegmentID(u)
 		status := "partial"
 		if u.Definite {
 			status = "final"
@@ -281,15 +363,19 @@ func (s *session) onASREvent(ev asr.Event) {
 		s.lastSent[segID] = fingerprint
 		s.segMu.Unlock()
 
-		s.writeJSON(map[string]any{
-			"type":       "subtitle",
-			"segment_id": segID,
-			"source":     u.Text,
-			"target":     "", // 译文由翻译 worker 异步回填
-			"status":     status,
-			"start_time": u.StartTime,
-			"end_time":   u.EndTime,
-		})
+		// 翻译开启时只推送带译文的字幕(由 partial/final 翻译路径回填),
+		// 避免 ASR 空 target 消息触发前端整屏重绘、拖慢同步感。
+		if !s.trEnabled {
+			s.writeJSON(map[string]any{
+				"type":       "subtitle",
+				"segment_id": segID,
+				"source":     u.Text,
+				"target":     u.Text,
+				"status":     status,
+				"start_time": u.StartTime,
+				"end_time":   u.EndTime,
+			})
+		}
 
 		if s.trEnabled {
 			if u.Definite {
@@ -332,10 +418,57 @@ func (s *session) enqueueTranslate(segID, source string, start, end int) {
 	}
 	s.segMu.Unlock()
 
-	// 该句已定稿,后续不再需要 partial 预览状态。
+	srcLang, _ := s.languages()
+	policy := translate.SegmentPolicyFor(source, srcLang)
+
+	if !policy.DisableClauseFlush {
+		s.flushRemainingTail(segID, source, start, end)
+	}
+
+	partialTarget := s.snapshotPartialTarget(segID)
+	promoteWait := config.Translate.PartialPromoteWait
+	if policy.PromotePartialOnFinal && policy.PartialPromoteWait > 0 {
+		promoteWait = policy.PartialPromoteWait
+	}
+	if partialTarget == "" && promoteWait > 0 {
+		partialTarget = s.waitPartialTarget(segID, promoteWait)
+	}
+	s.partMu.Lock()
+	ps := s.partState[segID]
+	fullyChunked := ps != nil && ps.lockedSource == strings.TrimSpace(source)
+	s.partMu.Unlock()
+
 	s.partMu.Lock()
 	delete(s.partState, segID)
 	s.partMu.Unlock()
+
+	if fullyChunked {
+		s.segMu.Lock()
+		if st, ok := s.segments[segID]; ok {
+			st.translated = true
+			st.revised = false
+			if partialTarget != "" {
+				st.target = partialTarget
+			}
+		}
+		s.segMu.Unlock()
+		return
+	}
+
+	if config.Translate.RefinePromoted && partialTarget != "" && !policy.DisableClauseFlush {
+		s.applyFinalTranslation(segID, source, partialTarget, start, end, isRevision)
+		go s.refineSegmentAsync(segID)
+		return
+	}
+
+	// 仅 CJK 等开启秒升;英语走完整定稿翻译(用户验证过的行为)。
+	if policy.PromotePartialOnFinal && partialTarget != "" {
+		s.applyFinalTranslation(segID, source, partialTarget, start, end, isRevision)
+		if config.Translate.RefinePromoted && !policy.SkipBackgroundRefine {
+			go s.refineSegmentAsync(segID)
+		}
+		return
+	}
 
 	select {
 	case s.trQueue <- segID:
@@ -344,14 +477,191 @@ func (s *session) enqueueTranslate(segID, source string, start, end int) {
 	}
 }
 
-// maybeTranslatePartial 边说边译:对「说话中」的句子做节流翻译。
-// 节流策略:同句已有翻译在途则跳过;原文增量不足 PartialMinChars 则跳过;
-// 距上次送译不足 PartialMinInterval 则跳过。满足条件才异步翻译一次。
+// maybeTranslatePartial 边说边译:长句按小句切分上屏;尾部短片段流式翻译,避免长时间空白。
 func (s *session) maybeTranslatePartial(segID, source string, start, end int) {
 	source = strings.TrimSpace(source)
 	if source == "" {
 		return
 	}
+	srcLang, _ := s.languages()
+	policy := translate.SegmentPolicyFor(source, srcLang)
+
+	if !policy.DisableClauseFlush {
+		s.flushCompletedClauses(segID, source, start, end)
+	}
+
+	tail := source
+	if !policy.DisableClauseFlush {
+		s.partMu.Lock()
+		ps := s.partState[segID]
+		locked := ""
+		if ps != nil {
+			locked = ps.lockedSource
+		}
+		s.partMu.Unlock()
+		tail = translate.RemainingClauseTail(source, locked)
+	}
+	if tail == "" {
+		return
+	}
+	s.maybeTranslatePartialTail(segID, tail, source, start, end)
+}
+
+func (s *session) flushCompletedClauses(segID, source string, start, end int) {
+	s.partMu.Lock()
+	ps := s.partState[segID]
+	if ps == nil {
+		ps = &partialState{}
+		s.partState[segID] = ps
+	}
+	locked := ps.lockedSource
+	s.partMu.Unlock()
+
+	srcLang, tgtLang := s.languages()
+	policy := translate.SegmentPolicyFor(source, srcLang)
+	clauses, newLocked := translate.SplitCompletedClausesWithPolicy(source, locked, policy)
+	if len(clauses) == 0 {
+		return
+	}
+	_ = newLocked
+
+	gen := s.currentLangGen()
+	for _, clause := range clauses {
+		clause = strings.TrimSpace(clause)
+		if clause == "" {
+			continue
+		}
+		s.partMu.Lock()
+		ps = s.partState[segID]
+		if ps == nil {
+			ps = &partialState{}
+			s.partState[segID] = ps
+		}
+		idx := ps.clauseSeq
+		ps.clauseSeq++
+		var history []translate.Pair
+		if prevSrc := strings.TrimSpace(ps.lastClauseSource); prevSrc != "" {
+			if prevTgt := strings.TrimSpace(ps.lastClauseTarget); prevTgt != "" {
+				history = []translate.Pair{{Source: prevSrc, Target: prevTgt}}
+			}
+		}
+		s.partMu.Unlock()
+
+		target := clause
+		if !translate.ShouldPassthrough(clause, srcLang, tgtLang) {
+			t, err := s.tr.TranslateCompact(s.ctx, clause, history, tgtLang, srcLang)
+			if err != nil || strings.TrimSpace(t) == "" {
+				continue
+			}
+			target = strings.TrimSpace(t)
+		}
+		if gen != s.currentLangGen() {
+			return
+		}
+		chunkID := fmt.Sprintf("%s-c%d", segID, idx)
+		s.writeSubtitle(map[string]any{
+			"type":       "subtitle",
+			"segment_id": chunkID,
+			"target":     target,
+			"status":     "final",
+			"start_time": start,
+			"end_time":   end,
+		})
+		s.partMu.Lock()
+		if ps := s.partState[segID]; ps != nil {
+			ps.lastClauseSource = clause
+			ps.lastClauseTarget = target
+			rest := source
+			if ps.lockedSource != "" && strings.HasPrefix(source, ps.lockedSource) {
+				rest = source[len(ps.lockedSource):]
+			}
+			if i := strings.Index(rest, clause); i >= 0 {
+				endPos := len(source) - len(rest) + i + len(clause)
+				if endPos <= len(source) {
+					ps.lockedSource = strings.TrimSpace(source[:endPos])
+				}
+			}
+		}
+		s.partMu.Unlock()
+	}
+}
+
+func (s *session) partialDisplayID(segID, source string) string {
+	srcLang, _ := s.languages()
+	if translate.SegmentPolicyFor(source, srcLang).DisableClauseFlush {
+		return segID
+	}
+	s.partMu.Lock()
+	defer s.partMu.Unlock()
+	ps := s.partState[segID]
+	if ps == nil {
+		return segID
+	}
+	return fmt.Sprintf("%s-c%d", segID, ps.clauseSeq)
+}
+
+func (s *session) flushRemainingTail(segID, source string, start, end int) {
+	srcLang, _ := s.languages()
+	if translate.SegmentPolicyFor(source, srcLang).DisableClauseFlush {
+		return
+	}
+	s.flushCompletedClauses(segID, source, start, end)
+
+	s.partMu.Lock()
+	ps := s.partState[segID]
+	locked := ""
+	if ps != nil {
+		locked = ps.lockedSource
+	}
+	s.partMu.Unlock()
+
+	tail := translate.RemainingClauseTail(source, locked)
+	if tail == "" {
+		return
+	}
+
+	srcLang, tgtLang := s.languages()
+	gen := s.currentLangGen()
+	target := tail
+	if !translate.ShouldPassthrough(tail, srcLang, tgtLang) {
+		if t := s.snapshotPartialTarget(segID); t != "" {
+			target = t
+		} else {
+			t, err := s.tr.TranslateCompact(s.ctx, tail, nil, tgtLang, srcLang)
+			if err != nil || strings.TrimSpace(t) == "" {
+				return
+			}
+			target = strings.TrimSpace(t)
+		}
+	}
+	if gen != s.currentLangGen() {
+		return
+	}
+
+	s.partMu.Lock()
+	ps = s.partState[segID]
+	if ps == nil {
+		ps = &partialState{}
+		s.partState[segID] = ps
+	}
+	idx := ps.clauseSeq
+	ps.lockedSource = source
+	ps.clauseSeq++
+	s.partMu.Unlock()
+
+	chunkID := fmt.Sprintf("%s-c%d", segID, idx)
+	s.writeSubtitle(map[string]any{
+		"type":       "subtitle",
+		"segment_id": chunkID,
+		"target":     target,
+		"status":     "final",
+		"start_time": start,
+		"end_time":   end,
+	})
+}
+
+// maybeTranslatePartialTail 对仍在说的小句尾部做流式 partial 翻译(输入短,首 token 更快)。
+func (s *session) maybeTranslatePartialTail(segID, tail, fullSource string, start, end int) {
 	cfg := config.Translate
 
 	s.partMu.Lock()
@@ -361,47 +671,157 @@ func (s *session) maybeTranslatePartial(segID, source string, start, end int) {
 		s.partState[segID] = ps
 	}
 	now := time.Now()
-	grown := len([]rune(source)) - len([]rune(ps.lastSource))
+	grown := len([]rune(tail)) - len([]rune(ps.lastSource))
 	first := ps.lastSource == ""
-	if ps.inflight ||
-		(!first && now.Sub(ps.lastAt) < cfg.PartialMinInterval) ||
-		(!first && grown < cfg.PartialMinChars) {
+
+	if ps.inflight {
+		if tail != ps.lastSource {
+			ps.pendingSource = fullSource
+			srcLang, _ := s.languages()
+			policy := translate.SegmentPolicyFor(fullSource, srcLang)
+			minChars := cfg.PartialMinChars
+			if policy.PartialMinChars > 0 {
+				minChars = policy.PartialMinChars
+			}
+			cancelThreshold := minChars + 2
+			if policy.PartialCancelGrow > 0 {
+				cancelThreshold = policy.PartialCancelGrow
+			}
+			if cancelThreshold < 3 {
+				cancelThreshold = 3
+			}
+			if grown >= cancelThreshold && ps.cancel != nil {
+				ps.cancel()
+			}
+		}
 		s.partMu.Unlock()
 		return
 	}
+	if !first {
+		srcLang, _ := s.languages()
+		policy := translate.SegmentPolicyFor(fullSource, srcLang)
+		minInterval := cfg.PartialMinInterval
+		if policy.PartialMinInterval > 0 {
+			minInterval = policy.PartialMinInterval
+		}
+		if now.Sub(ps.lastAt) < minInterval {
+			s.partMu.Unlock()
+			return
+		}
+		minChars := cfg.PartialMinChars
+		if policy.PartialMinChars > 0 {
+			minChars = policy.PartialMinChars
+		}
+		if minChars > 0 && grown < minChars {
+			s.partMu.Unlock()
+			return
+		}
+	}
+	srcLang, _ := s.languages()
+	policy := translate.SegmentPolicyFor(fullSource, srcLang)
+	minTail := policy.PartialMinTail
+	if minTail <= 0 {
+		minTail = 15
+	}
+	if len([]rune(strings.TrimSpace(tail))) < minTail {
+		s.partMu.Unlock()
+		return
+	}
+
+	partialCtx, cancel := context.WithCancel(s.ctx)
 	ps.inflight = true
-	ps.lastSource = source
+	ps.lastSource = tail
 	ps.lastAt = now
+	ps.pendingSource = ""
+	ps.cancel = cancel
 	s.partMu.Unlock()
 
-	go s.translatePartial(segID, source, start, end)
+	go s.translatePartial(segID, tail, start, end, partialCtx)
 }
 
-// translatePartial 异步翻译一段「说话中」的原文并作为 partial 预览下发。
-// 不带上下文(更快、更省),不进纠错/TTS;若该句此时已定稿则丢弃过期预览。
-func (s *session) translatePartial(segID, source string, start, end int) {
+func (s *session) translatePartial(segID, source string, start, end int, partialCtx context.Context) {
 	gen := s.currentLangGen()
 	defer func() {
 		s.partMu.Lock()
-		if ps := s.partState[segID]; ps != nil {
+		ps := s.partState[segID]
+		var pending string
+		if ps != nil {
 			ps.inflight = false
+			ps.cancel = nil
+			pending = ps.pendingSource
+			ps.pendingSource = ""
 		}
 		s.partMu.Unlock()
+		if pending != "" {
+			s.maybeTranslatePartial(segID, pending, start, end)
+		}
 	}()
 
-	target, err := s.resolveTargetText(source, nil)
+	srcLang, tgtLang := s.languages()
+	if translate.ShouldPassthrough(source, srcLang, tgtLang) {
+		s.emitPartialTranslation(s.partialDisplayID(segID, source), source, source, start, end, gen)
+		return
+	}
+
+	s.partMu.Lock()
+	ps := s.partState[segID]
+	var history []translate.Pair
+	if ps != nil {
+		if prevSrc := strings.TrimSpace(ps.lastClauseSource); prevSrc != "" {
+			if prevTgt := strings.TrimSpace(ps.lastClauseTarget); prevTgt != "" {
+				history = []translate.Pair{{Source: prevSrc, Target: prevTgt}}
+			}
+		}
+	}
+	s.partMu.Unlock()
+
+	onChunk := func(acc string) error {
+		if gen != s.currentLangGen() {
+			return translate.ErrStreamAbort
+		}
+		s.segMu.Lock()
+		st := s.segments[segID]
+		finalized := st != nil && st.translated
+		s.segMu.Unlock()
+		if finalized {
+			return translate.ErrStreamAbort
+		}
+		s.emitPartialTranslation(s.partialDisplayID(segID, source), source, acc, start, end, gen)
+		return nil
+	}
+
+	target, err := s.tr.TranslatePartial(partialCtx, source, history, tgtLang, srcLang, onChunk)
 	if err != nil {
-		s.log.Debug("partial translate failed", slog.String("seg", segID), slog.String("err", err.Error()))
+		if err != translate.ErrStreamAbort && partialCtx.Err() == nil {
+			s.log.Debug("partial translate failed", slog.String("seg", segID), slog.String("err", err.Error()))
+		}
 		return
 	}
-	if strings.TrimSpace(target) == "" {
-		return
+	if strings.TrimSpace(target) != "" {
+		s.emitPartialTranslation(s.partialDisplayID(segID, source), source, target, start, end, gen)
 	}
+}
+
+func (s *session) emitPartialTranslation(segID, source, target string, start, end int, gen uint64) {
 	if gen != s.currentLangGen() {
 		return
 	}
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return
+	}
+	s.partMu.Lock()
+	ps := s.partState[segID]
+	if ps != nil {
+		ps.lastTarget = target
+		if ps.lastPushedTarget == target {
+			s.partMu.Unlock()
+			return
+		}
+		ps.lastPushedTarget = target
+	}
+	s.partMu.Unlock()
 
-	// 期间该句若已定稿并产生正式译文,丢弃这次过期的 partial 预览,避免回退覆盖。
 	s.segMu.Lock()
 	st := s.segments[segID]
 	finalized := st != nil && st.translated
@@ -410,15 +830,125 @@ func (s *session) translatePartial(segID, source string, start, end int) {
 		return
 	}
 
-	s.writeJSON(map[string]any{
+	s.writeSubtitle(map[string]any{
+		"type":       "subtitle",
+		"segment_id": segID,
+		"target":     target,
+		"status":     "partial",
+	})
+}
+
+func (s *session) applyFinalTranslation(segID, source, target string, start, end int, corrected bool) {
+	_, tgtLang := s.languages()
+	s.segMu.Lock()
+	st := s.segments[segID]
+	if st == nil || st.source != source {
+		s.segMu.Unlock()
+		return
+	}
+	st.target = target
+	st.targetLang = tgtLang
+	st.translated = true
+	st.revised = false
+	s.segMu.Unlock()
+
+	s.writeSubtitle(map[string]any{
 		"type":       "subtitle",
 		"segment_id": segID,
 		"source":     source,
 		"target":     target,
-		"status":     "partial",
+		"status":     "final",
 		"start_time": start,
 		"end_time":   end,
+		"corrected":  corrected,
 	})
+	s.log.Debug("translation backfilled", slog.String("seg", segID), slog.Bool("promoted", true))
+	s.enqueueTTS(segID, target, tgtLang)
+	s.triggerReview()
+}
+
+func (s *session) refineSegmentAsync(segID string) {
+	if !config.Translate.RefinePromoted {
+		return
+	}
+	if d := config.Translate.RefineDelay; d > 0 {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(d):
+		}
+	}
+	s.segMu.Lock()
+	st := s.segments[segID]
+	if st == nil || !st.translated {
+		s.segMu.Unlock()
+		return
+	}
+	source, seq, start, end, oldTarget := st.source, st.seq, st.startTime, st.endTime, st.target
+	s.segMu.Unlock()
+
+	srcLang, tgtLang := s.languages()
+	target := oldTarget
+	if !translate.ShouldPassthrough(source, srcLang, tgtLang) {
+		var err error
+		target, err = s.tr.TranslateCompact(s.ctx, source, s.buildContext(seq), tgtLang, srcLang)
+		if err != nil || strings.TrimSpace(target) == "" || target == oldTarget {
+			return
+		}
+	} else if target == oldTarget {
+		return
+	}
+
+	s.segMu.Lock()
+	st = s.segments[segID]
+	if st == nil || st.source != source || st.target != oldTarget {
+		s.segMu.Unlock()
+		return
+	}
+	st.target = target
+	st.targetLang = tgtLang
+	s.segMu.Unlock()
+
+	s.writeSubtitle(map[string]any{
+		"type":       "subtitle",
+		"segment_id": segID,
+		"source":     source,
+		"target":     target,
+		"status":     "final",
+		"start_time": start,
+		"end_time":   end,
+		"corrected":  true,
+	})
+	s.enqueueTTS(segID, target, tgtLang)
+}
+
+func (s *session) snapshotPartialTarget(segID string) string {
+	s.partMu.Lock()
+	defer s.partMu.Unlock()
+	ps := s.partState[segID]
+	if ps == nil {
+		return ""
+	}
+	if t := strings.TrimSpace(ps.lastTarget); t != "" {
+		return t
+	}
+	return strings.TrimSpace(ps.lastPushedTarget)
+}
+
+func (s *session) waitPartialTarget(segID string, maxWait time.Duration) string {
+	deadline := time.Now().Add(maxWait)
+	for {
+		if t := s.snapshotPartialTarget(segID); t != "" {
+			return t
+		}
+		s.partMu.Lock()
+		inflight := s.partState[segID] != nil && s.partState[segID].inflight
+		s.partMu.Unlock()
+		if !inflight || time.Now().After(deadline) {
+			return s.snapshotPartialTarget(segID)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // translateLoop 串行消费翻译队列,保证上下文顺序一致、避免并发打爆接口。
@@ -474,6 +1004,10 @@ func (s *session) translateSegment(segID string) {
 		s.segMu.Unlock()
 		return
 	}
+	if st.translated && !st.revised {
+		s.segMu.Unlock()
+		return
+	}
 	source, seq, start, end := st.source, st.seq, st.startTime, st.endTime
 	s.segMu.Unlock()
 
@@ -510,7 +1044,7 @@ func (s *session) translateSegment(segID string) {
 	st.revised = false
 	s.segMu.Unlock()
 
-	s.writeJSON(map[string]any{
+	s.writeSubtitle(map[string]any{
 		"type":       "subtitle",
 		"segment_id": segID,
 		"source":     source,
@@ -706,7 +1240,7 @@ func (s *session) reviewRecent() {
 		source, start, end := st.source, st.startTime, st.endTime
 		s.segMu.Unlock()
 
-		s.writeJSON(map[string]any{
+		s.writeSubtitle(map[string]any{
 			"type":       "subtitle",
 			"segment_id": id,
 			"source":     source,

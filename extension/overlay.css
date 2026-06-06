@@ -170,6 +170,11 @@
 }
 
 /* committed / tentative 都继承字幕主色;tentative 半透明 + 斜体表达「还在变」。 */
+#__simul_interpreter_overlay__ .si-line,
+#__simul_interpreter_overlay__ .si-tentative-line {
+  display: block;
+}
+
 #__simul_interpreter_overlay__ .si-committed,
 #__simul_interpreter_overlay__ .si-tentative {
   color: inherit;

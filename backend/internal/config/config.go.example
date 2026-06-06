@@ -35,8 +35,14 @@ const (
 	// ASRResourceID 对应请求头 X-Api-Resource-Id,固定值,无需改动。
 	ASRResourceID = "volc.bigasr.sauc.duration"
 
-	// ASRWebSocketURL 是大模型流式 ASR 的 WebSocket 接入地址。
+	// ASRWebSocketURL 双向流式 ASR(旧版,保留兼容)。
 	ASRWebSocketURL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
+
+	// ASRWebSocketURLAsync 双向流式优化版:英/中/自动检测使用(与英→中同款)。
+	ASRWebSocketURLAsync = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
+
+	// ASRWebSocketURLNostream 流式输入模式:日/韩/俄/法/德/西/粤等显式源语言使用。
+	ASRWebSocketURLNostream = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream"
 
 	// ASRModelName 模型名称,目前固定为 bigmodel。
 	ASRModelName = "bigmodel"
@@ -49,7 +55,9 @@ type ASRRequestConfig struct {
 	EnableDDC      bool   // 语义顺滑(去口头语/重复)
 	ShowUtterances bool   // 输出分句信息(text/start_time/end_time/definite)
 	ResultType     string // "full"=全量返回;"single"=增量返回
-	EndWindowSize  int    // 强制判停时间(ms),静音超过即定稿;0 表示不显式设置
+	EnableNonstream bool  // async 端点:实时逐字+停顿后二遍精修(英→中同款)
+	EndWindowSize         int // async 判停(ms)
+	EndWindowSizeNostream int // nostream 判停(ms);其他语种 ASR
 }
 
 // ASRRequest 当前生效的 ASR 识别参数。
@@ -58,8 +66,10 @@ var ASRRequest = ASRRequestConfig{
 	EnablePunc:     true,
 	EnableDDC:      false,
 	ShowUtterances: true,
-	ResultType:     "full",
-	EndWindowSize:  200, // 静音 200ms 即判停:更快把「正在说」的句子定稿,淡色预览更快变实色;过低会把一句切碎,200 是较稳的下限
+	ResultType:            "full",
+	EnableNonstream:       true,
+	EndWindowSize:         150,
+	EndWindowSizeNostream: 250,
 }
 
 // ───────────────────────────────────────────────────────────────────────────

@@ -15,15 +15,15 @@
 //     避免「居中 + 按字滑动」造成的整行横移、读到一半被挤走找不到的问题;
 //   - 因为永远在流动,没有「出现 → 等死 → 消失」的硬节奏,消除「字幕停留太久」
 //     和「音画不同步」的别扭感;
-//   - 静音清屏:连续说话时只滚动不消失,但一旦超过 ~3 秒没识别到新内容,字幕条
-//     自动清空留白(滚动效果不变),再次说话时新句子从空白处重新开始滚动;
+//   - 连续说话时字幕只向上滚、不整屏消失;下一句接在底部,上一句留在滚动区上方;
+//   - 仅在「停止翻译」时清空字幕;翻译进行中不因静音自动清屏;
 //   - 无声音自动停止(可选):桌宠面板可开关,并自定义静音多久后自动停翻;
 //   - 字幕可选中复制;上方四向箭头把手专用于拖动改位置,与选字互不干扰;
 //   - 纠错高亮:被自动纠正过的句子以绿色底色长亮标记,不再淡出消失。
 
 (() => {
   // 版本号变化时允许重新注入(否则扩展热更新后页面仍跑旧逻辑)。
-  const CONTENT_SCRIPT_VERSION = 6;
+  const CONTENT_SCRIPT_VERSION = 11;
   if (window.__simulInterpreterVersion === CONTENT_SCRIPT_VERSION) return;
   window.__simulInterpreterVersion = CONTENT_SCRIPT_VERSION;
   document.getElementById("__simul_interpreter_pet__")?.remove();
@@ -35,8 +35,7 @@
   // 几句:一是便于 ASR / LLM 复审对已滚出视野的句子做修订时仍能正确更新,二是滚动
   // 历史更连贯。超过此数丢最早的(它们早就滚出视野)。
   const FINAL_BUFFER_SIZE = 50;
-  // 静音自动清屏:超过这么久没有识别到新内容,就把当前字幕条清空(留白)。
-  // 之后一旦再识别到声音,新句子从空白处重新开始滚动,不影响滚动效果本身。
+  // 翻译进行中不自动清屏(字幕只滚上去、不消失);以下常量保留供将来可选功能。
   const CLEAR_AFTER_SILENCE_MS = 3000;
   // 无声音自动停止:默认关闭;时长与开关由桌宠面板设置并持久化。
   const DEFAULT_AUTO_STOP_SILENCE_ENABLED = false;
@@ -220,6 +219,7 @@
     finals.clear();
     tentative.segId = null;
     tentative.target = "";
+    lastCommittedSnapshot = "";
     lastActivityAt = 0;
     clearedIds.clear();
     correctedIds.clear();
@@ -450,6 +450,56 @@
     return pieces;
   }
 
+  // 已定稿快照:partial 更新时只动末尾预览行,已定稿行(含纠错绿底)不重绘。
+  let lastCommittedSnapshot = "";
+
+  function committedSnapshot() {
+    let k = "";
+    for (const [id, txt] of finals) k += id + "\x1f" + txt + "\x1e";
+    return k;
+  }
+
+  // 仅更新正在说的 preview 行;已定稿句保持不动(滚动 + 纠错常亮不丢)。
+  function renderTentative() {
+    if (hasCaptionSelection()) {
+      selectionDeferredRender = true;
+      return;
+    }
+    const snap = committedSnapshot();
+    if (snap !== lastCommittedSnapshot) {
+      render(true);
+      return;
+    }
+    const overlay = ensureOverlay();
+    const caption = overlay.querySelector(".si-caption");
+    if (!caption) return;
+
+    let wrap = caption.querySelector(".si-tentative-line");
+    if (!tentative.target || (tentative.segId && finals.has(tentative.segId))) {
+      wrap?.remove();
+      overlay.classList.toggle("si-empty", finals.size === 0 && !running);
+      if (stickToBottom) caption.scrollTop = caption.scrollHeight;
+      return;
+    }
+
+    if (!wrap) {
+      wrap = document.createElement("div");
+      wrap.className = "si-tentative-line si-line";
+      const span = document.createElement("span");
+      span.className = "si-tentative";
+      wrap.appendChild(span);
+      caption.appendChild(wrap);
+    }
+    const span = wrap.querySelector(".si-tentative");
+    if (span.textContent === tentative.target) {
+      if (stickToBottom) caption.scrollTop = caption.scrollHeight;
+      return;
+    }
+    span.textContent = tentative.target;
+    overlay.classList.remove("si-empty");
+    if (stickToBottom) caption.scrollTop = caption.scrollHeight;
+  }
+
   // 渲染字幕:左对齐 + 底部锚定的竖直滚动(参考 YouTube / 系统实时字幕)。
   // 关键改动:不再「按末尾 N 字滑动 + 居中」——那会让整行每来一个字就重新居中、
   // 向左横移,导致正在读的内容一直在跑、读不完就被挤走。现在文字左对齐、自然换行、
@@ -469,21 +519,27 @@
 
     const pieces = buildPieces();
 
-    // 按分段重建 span。.si-caption 本身不重建,挂在它上面的拖动监听不受影响。
+    // 按句分行重建:每句定稿一行,向上滚;当前 partial 接在最后一行。
     caption.textContent = "";
-    pieces.forEach((it, idx) => {
-      if (idx > 0) caption.appendChild(document.createTextNode(" "));
+    pieces.forEach((it) => {
       const span = document.createElement("span");
       span.className = it.tentative ? "si-tentative" : "si-committed";
       span.textContent = it.text;
       if (!it.tentative && correctedIds.has(it.id)) {
         span.classList.add("si-corrected");
       }
-      caption.appendChild(span);
+      if (it.tentative) {
+        caption.appendChild(span);
+      } else {
+        const line = document.createElement("div");
+        line.className = "si-line";
+        line.appendChild(span);
+        caption.appendChild(line);
+      }
     });
 
-    // 字幕条整体可见性:有任何内容才显示,完全没有就隐藏(避免空黑条)。
-    overlay.classList.toggle("si-empty", pieces.length === 0);
+    // 翻译进行中即使 momentarily 无新字也不隐藏字幕条(避免「闪没再出现」)。
+    overlay.classList.toggle("si-empty", pieces.length === 0 && !running);
     // 粘底时停在最底显示最新两行;用户在看历史(未粘底)时,还原其滚动位置,
     // 不被新字幕拽回底部(内容是向末尾追加的,顶部稳定,还原位置即可保持视图)。
     if (stickToBottom) {
@@ -491,22 +547,19 @@
     } else {
       caption.scrollTop = prevScrollTop;
     }
-
+    lastCommittedSnapshot = committedSnapshot();
   }
 
-  // 标记某段曾被自动纠正,绿色长亮直到清屏/停翻。
+  // 标记某段曾被自动纠正(ASR 修订 / Pro 精修 / LLM 复审),绿色长亮直到停翻。
   function markCorrected(segId) {
-    if (!segId || !finals.has(segId)) return;
+    if (!segId) return;
     correctedIds.add(segId);
     lastCorrectionShownAt = Date.now();
   }
 
-  // 静音清屏:翻译进行中,若超过 CLEAR_AFTER_SILENCE_MS 没有新内容进来,
-  // 就把当前字幕条清空(隐藏)。被清掉的句子 id 记下来,避免它们的迟到更新
-  // 把字幕条又唤回;clearedIds 每次只保留「刚清掉的这一屏」,内存不会无限增长。
-  // 之后一旦再识别到声音,新句子(新 id)正常进入,字幕从空白处重新开始滚动。
+  // 翻译进行中不清屏:字幕只向上滚,下一句接在底部。仅停止翻译时 removeOverlay 清空。
   function clearCaptionOnSilence() {
-    if (!running) return;
+    if (running) return;
     if (finals.size === 0 && !tentative.target) return;
     // 用户正在向上滚动看历史译文:暂停清屏,免得正读着就被清空。
     if (!stickToBottom) return;
@@ -1011,10 +1064,12 @@
     if (msg.type === "subtitle") {
       setRunning(true);
       ingestSubtitle(msg);
-      // 后端标记 corrected=true:本句由「ASR 修订重译」或「LLM 复审」纠正过,
-      // 打上绿色长亮标记,方便辨认哪些句子被自动改过。
       if (msg.corrected) markCorrected(msg.segment_id);
-      render();
+      if (msg.status === "final" || msg.corrected) {
+        render();
+      } else if (msg.target) {
+        renderTentative();
+      }
       // 有新译文就让桌宠张嘴做一下「正在说话」动画(不再弹气泡,避免遮挡页面)。
       if (msg.target) petTalk();
     } else if (msg.type === "translate_error") {

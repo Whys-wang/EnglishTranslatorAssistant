@@ -8,19 +8,25 @@
 package translate
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"log/slog"
 
 	"simul-interpreter/internal/config"
 )
+
+// ErrStreamAbort 表示流式翻译被上层主动取消(如 ASR 原文已更新)。
+var ErrStreamAbort = errors.New("stream aborted")
 
 // Pair 是一段「原文 => 译文」上下文。
 type Pair struct {
@@ -37,8 +43,18 @@ type Client struct {
 // NewClient 创建一个翻译客户端。
 func NewClient(log *slog.Logger) *Client {
 	return &Client{
-		log:  log,
-		http: &http.Client{Timeout: config.Translate.Timeout},
+		log: log,
+		http: &http.Client{
+			Timeout: config.Translate.Timeout,
+			Transport: &http.Transport{
+				MaxIdleConns:          16,
+				MaxIdleConnsPerHost:   16,
+				IdleConnTimeout:       90 * time.Second,
+				DisableCompression:    true,
+				ResponseHeaderTimeout: 12 * time.Second,
+				ForceAttemptHTTP2:     true,
+			},
+		},
 	}
 }
 
@@ -138,8 +154,10 @@ func buildSystemPrompt(target, source string) string {
 	sb.WriteString(",无论原文是什么语言,最终字幕只能是")
 	sb.WriteString(target)
 	sb.WriteString("。\n")
+	sb.WriteString("7. 你是同声传译字幕,不是词典/翻译教程:严禁注释、严禁「注：」、严禁释义、严禁罗列词义、严禁说明如何翻译;\n")
+	sb.WriteString("8. 即使原文只有一个单词,也只输出该词在语境下的口语译文,不要解释。\n")
 	if s := NormalizeLang(source); s != "" {
-		sb.WriteString("7. 原文语言为")
+		sb.WriteString("9. 原文语言为")
 		sb.WriteString(s)
 		if LangsEquivalent(source, target) {
 			sb.WriteString(",与目标语言相同:请主要做口语化润色与 ASR 错字纠正,不要翻译成其他语言。\n")
@@ -149,6 +167,144 @@ func buildSystemPrompt(target, source string) string {
 	}
 	writeDomainAndGlossary(&sb)
 	return sb.String()
+}
+
+func partialModel() string {
+	if m := strings.TrimSpace(config.ArkPartialModel); m != "" && !strings.HasPrefix(m, "PLEASE_FILL") {
+		return m
+	}
+	return config.ArkModel
+}
+
+func partialTemperature() float64 {
+	if t := config.Translate.PartialTemperature; t > 0 {
+		return t
+	}
+	return config.Translate.Temperature
+}
+
+func buildPartialSystemPrompt(target, source string) string {
+	target = resolveTarget(target)
+	var sb strings.Builder
+	sb.WriteString("实时同声传译字幕。只输出一行")
+	sb.WriteString(target)
+	sb.WriteString("口语译文。禁止注释、禁止「注：」、禁止释义、禁止罗列词义、禁止说明如何翻译。")
+	sb.WriteString(streamSubtitleHint(source))
+	if s := NormalizeLang(source); s != "" {
+		sb.WriteString("原文")
+		sb.WriteString(s)
+		sb.WriteString("。")
+	}
+	return sb.String()
+}
+
+func buildCompactSystemPrompt(target, source string) string {
+	target = resolveTarget(target)
+	var sb strings.Builder
+	sb.WriteString("同声传译字幕。只输出")
+	sb.WriteString(target)
+	sb.WriteString("译文一行。禁止注释、禁止释义、禁止词典说明。")
+	sb.WriteString(streamSubtitleHint(source))
+	if s := NormalizeLang(source); s != "" {
+		sb.WriteString("原文")
+		sb.WriteString(s)
+		sb.WriteString("。")
+	}
+	return sb.String()
+}
+
+// streamSubtitleHint 按源语给出简短口译风格提示(参考多语种同传字幕惯例)。
+func streamSubtitleHint(sourceLang string) string {
+	switch NormalizeLang(sourceLang) {
+	case "日语":
+		return "日语口译,自然敬体,只译字幕不解释。"
+	case "韩语":
+		return "韩语口译,自然口语,只译字幕不解释。"
+	case "俄语":
+		return "俄语口译,完整语义,只译字幕不解释。"
+	case "法语", "德语", "西班牙语":
+		return "口译完整句意,只译字幕不解释。"
+	case "中文", "粤语":
+		return "中文口译,通顺口语,只译字幕不解释。"
+	default:
+		return ""
+	}
+}
+
+func (c *Client) TranslatePartial(ctx context.Context, source string, history []Pair, target, sourceLang string, onChunk func(string) error) (string, error) {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return "", nil
+	}
+	messages := make([]chatMessage, 0, 2+2*len(history))
+	messages = append(messages, chatMessage{Role: "system", Content: buildPartialSystemPrompt(target, sourceLang)})
+	for _, p := range history {
+		if strings.TrimSpace(p.Source) == "" || strings.TrimSpace(p.Target) == "" {
+			continue
+		}
+		messages = append(messages,
+			chatMessage{Role: "user", Content: p.Source},
+			chatMessage{Role: "assistant", Content: p.Target},
+		)
+	}
+	messages = append(messages, chatMessage{Role: "user", Content: "【待翻译原文】\n" + source})
+	maxTok := config.Translate.PartialMaxTokens
+	if maxTok <= 0 {
+		maxTok = 128
+	}
+	reqBody := chatRequest{
+		Model:       partialModel(),
+		Messages:    messages,
+		Temperature: partialTemperature(),
+		MaxTokens:   maxTok,
+		Thinking:    &thinkingOption{Type: "disabled"},
+	}
+	wrapped := onChunk
+	if onChunk != nil {
+		wrapped = func(acc string) error {
+			cleaned := SanitizeTranslation(acc, source)
+			if cleaned == "" {
+				return nil
+			}
+			return onChunk(cleaned)
+		}
+	}
+	out, err := c.doChatStream(ctx, reqBody, wrapped)
+	return SanitizeTranslation(out, source), err
+}
+
+// TranslateCompact 定稿/精修用的短提示词翻译(同模型,更少 token 输入/输出上限)。
+func (c *Client) TranslateCompact(ctx context.Context, source string, history []Pair, target, sourceLang string) (string, error) {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return "", nil
+	}
+	messages := make([]chatMessage, 0, 2+2*len(history))
+	messages = append(messages, chatMessage{Role: "system", Content: buildCompactSystemPrompt(target, sourceLang)})
+	for _, p := range history {
+		if strings.TrimSpace(p.Source) == "" || strings.TrimSpace(p.Target) == "" {
+			continue
+		}
+		messages = append(messages,
+			chatMessage{Role: "user", Content: p.Source},
+			chatMessage{Role: "assistant", Content: p.Target},
+		)
+	}
+	messages = append(messages, chatMessage{Role: "user", Content: "【待翻译原文】\n" + source})
+	maxTok := config.Translate.MaxTokens
+	if maxTok <= 0 {
+		maxTok = 128
+	}
+	reqBody := chatRequest{
+		Model:       config.ArkModel,
+		Messages:    messages,
+		Temperature: config.Translate.Temperature,
+		MaxTokens:   maxTok,
+		Stream:      false,
+		Thinking:    &thinkingOption{Type: "disabled"},
+	}
+	out, err := c.doChat(ctx, reqBody)
+	return SanitizeTranslation(out, source), err
 }
 
 // Translate 把 source 翻译成 target(为空回退默认);history 为可选上下文,
@@ -185,7 +341,8 @@ func (c *Client) Translate(ctx context.Context, source string, history []Pair, t
 		// 翻译是确定性任务,关闭推理模型的深度思考以降低延迟(seed 系列支持)。
 		Thinking: &thinkingOption{Type: "disabled"},
 	}
-	return c.doChat(ctx, reqBody)
+	out, err := c.doChat(ctx, reqBody)
+	return SanitizeTranslation(out, source), err
 }
 
 // ReviewItem 是一条待复审的字幕(原文 + 当前译文)。
@@ -305,6 +462,115 @@ func (c *Client) doChat(ctx context.Context, reqBody chatRequest) (string, error
 		return "", fmt.Errorf("ark empty choices (raw=%s)", string(body))
 	}
 	return strings.TrimSpace(cr.Choices[0].Message.Content), nil
+}
+
+func (c *Client) Prewarm(ctx context.Context) {
+	if !Configured() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	warm := func(model string) {
+		if strings.TrimSpace(model) == "" || strings.HasPrefix(model, "PLEASE_FILL") {
+			return
+		}
+		reqBody := chatRequest{
+			Model:       model,
+			Messages:    []chatMessage{{Role: "user", Content: "hi"}},
+			MaxTokens:   1,
+			Temperature: 0,
+			Stream:      false,
+			Thinking:    &thinkingOption{Type: "disabled"},
+		}
+		_, _ = c.doChat(ctx, reqBody)
+	}
+	warm(partialModel())
+	if partialModel() != config.ArkModel {
+		warm(config.ArkModel)
+	}
+	// 预热流式连接,降低 partial 首 token 冷启动。
+	streamBody := chatRequest{
+		Model:       partialModel(),
+		Messages:    []chatMessage{{Role: "user", Content: "hi"}},
+		MaxTokens:   4,
+		Temperature: 0,
+		Thinking:    &thinkingOption{Type: "disabled"},
+	}
+	_, _ = c.doChatStream(ctx, streamBody, nil)
+}
+
+type streamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+	} `json:"choices"`
+}
+
+func (c *Client) doChatStream(ctx context.Context, reqBody chatRequest, onChunk func(string) error) (string, error) {
+	reqBody.Stream = true
+	raw, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("marshal ark stream request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, config.ArkEndpoint, bytes.NewReader(raw))
+	if err != nil {
+		return "", fmt.Errorf("build ark stream request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+config.ArkAPIKey)
+	httpReq.Header.Set("Accept", "text/event-stream")
+	resp, err := c.http.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("ark stream request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("ark stream http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var acc strings.Builder
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return strings.TrimSpace(acc.String()), ctx.Err()
+		default:
+		}
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var chunk streamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		part := chunk.Choices[0].Delta.Content
+		if part == "" {
+			continue
+		}
+		acc.WriteString(part)
+		if onChunk != nil {
+			if err := onChunk(acc.String()); err != nil {
+				if errors.Is(err, ErrStreamAbort) {
+					return strings.TrimSpace(acc.String()), ErrStreamAbort
+				}
+				return strings.TrimSpace(acc.String()), err
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return strings.TrimSpace(acc.String()), fmt.Errorf("read ark stream: %w", err)
+	}
+	return strings.TrimSpace(acc.String()), nil
 }
 
 // parseRevisions 从模型输出里抽取一个 JSON 对象数组(容忍 ```json 代码块包裹)。

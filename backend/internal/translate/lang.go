@@ -3,6 +3,8 @@ package translate
 import (
 	"strings"
 	"unicode"
+
+	"simul-interpreter/internal/config"
 )
 
 // NormalizeLang 把前端/配置里的语言名规范成统一写法(空串表示自动识别)。
@@ -67,6 +69,64 @@ func ShouldPassthrough(source, srcLang, tgtLang string) bool {
 	return textPrimarilyInLanguage(source, tgt)
 }
 
+// ASRLanguageCode 把统一语言名映射为火山 ASR audio.language 代码(空串=默认中英文模型)。
+// 注意:audio.language 仅在 bigmodel_nostream 端点生效。
+func ASRLanguageCode(lang string) string {
+	switch NormalizeLang(lang) {
+	case "中文":
+		return "zh-CN"
+	case "英语":
+		return "en-US"
+	case "日语":
+		return "ja-JP"
+	case "韩语":
+		return "ko-KR"
+	case "法语":
+		return "fr-FR"
+	case "德语":
+		return "de-DE"
+	case "西班牙语":
+		return "es-MX"
+	case "俄语":
+		return "ru-RU"
+	case "粤语":
+		return "yue-CN"
+	default:
+		return ""
+	}
+}
+
+// ASRUsesAsyncDefault 英语/中文/自动检测走 bigmodel_async + enable_nonstream(英→中同款)。
+func ASRUsesAsyncDefault(srcLang string) bool {
+	switch NormalizeLang(srcLang) {
+	case "", "英语", "中文":
+		return true
+	default:
+		return false
+	}
+}
+
+// ASRNeedsNostream 非英/中/自动的显式源语言走 bigmodel_nostream + audio.language。
+func ASRNeedsNostream(srcLang string) bool {
+	return !ASRUsesAsyncDefault(srcLang)
+}
+
+// ASREndWindowSize 返回 ASR 判停(ms)。仅日语使用更短窗口以加快定稿,其余语种不变。
+func ASREndWindowSize(srcLang string) int {
+	if NormalizeLang(srcLang) == "日语" {
+		return 75
+	}
+	if ASRNeedsNostream(srcLang) {
+		if config.ASRRequest.EndWindowSizeNostream > 0 {
+			return config.ASRRequest.EndWindowSizeNostream
+		}
+	}
+	if config.ASRRequest.EndWindowSize > 0 {
+		return config.ASRRequest.EndWindowSize
+	}
+	return 0
+}
+
 func textPrimarilyInLanguage(text, lang string) bool {
 	var han, kana, hangul, cyrillic, latin, other int
 	for _, r := range text {
@@ -119,4 +179,13 @@ func isHangul(r rune) bool {
 
 func isCyrillic(r rune) bool {
 	return unicode.Is(unicode.Cyrillic, r)
+}
+
+func hasKana(text string) bool {
+	for _, r := range text {
+		if isKana(r) {
+			return true
+		}
+	}
+	return false
 }
