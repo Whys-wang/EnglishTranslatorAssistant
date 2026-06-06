@@ -1,46 +1,165 @@
 // offscreen.js —— 在 offscreen 文档中执行音频采集与 WebSocket 推流。
 //
-// 里程碑 1:建立到后端的 WebSocket 连接,完成「start/ack」控制握手以验证空链路。
-// 里程碑 2:用 AudioWorklet 把标签页音频重采样为 16kHz/16bit/单声道 PCM,
-//          按 ~100ms 分片以二进制帧发送。
+// 里程碑 2:
+//   - 用 tabCapture 媒体流创建 AudioContext,接 AudioWorklet 重采样为 16kHz PCM;
+//   - 同时把原始音频接到扬声器,保证用户仍能听到标签页声音;
+//   - worklet 输出的 PCM(Int16, ~100ms/帧)以二进制帧经 WebSocket 发往后端;
+//   - WebSocket 断线指数退避自动重连;断开期间丢弃实时帧(不积压,保低延迟)。
 
 const BACKEND_WS_URL = "ws://localhost:8765/ws";
+const TARGET_SAMPLE_RATE = 16000;
+
+// 指数退避重连参数(与后端 config.Reconnect 保持一致量级)。
+const RECONNECT = {
+  initialMs: 500,
+  maxMs: 15000,
+  multiplier: 2,
+};
 
 let ws = null;
 let audioContext = null;
 let mediaStream = null;
+let sourceNode = null;
 let workletNode = null;
 
-function connectBackend() {
-  return new Promise((resolve, reject) => {
-    ws = new WebSocket(BACKEND_WS_URL);
-    ws.binaryType = "arraybuffer";
-    ws.onopen = () => {
-      ws.send(JSON.stringify({ type: "start" }));
-      resolve();
-    };
-    ws.onerror = (e) => reject(e);
-    ws.onmessage = (ev) => {
-      if (typeof ev.data !== "string") return;
-      let msg;
-      try {
-        msg = JSON.parse(ev.data);
-      } catch {
-        return;
-      }
-      // 后端回传的字幕事件 -> 交给 background 转发到页面 overlay。
-      if (msg.type === "subtitle") {
-        chrome.runtime.sendMessage({ target: "page-subtitle", ...msg });
-      }
-    };
-    ws.onclose = () => {
-      ws = null;
-    };
+let running = false; // 是否处于「采集中」(stop 后为 false,停止重连)。
+let reconnectDelay = RECONNECT.initialMs;
+let reconnectTimer = null;
+
+// 翻译方向(由 background 在 start 时传入,随 WS start 负载发往后端;重连时沿用)。
+let cfgSourceLang = "";
+let cfgTargetLang = "中文";
+
+// 与 background(Service Worker)之间的常驻连接:
+//   - 让 SW 在采集期间保持存活(否则会被回收,字幕消息无人接收);
+//   - 作为字幕事件的可靠通道。端口约 5 分钟会被系统回收,断开后自动重连。
+let swPort = null;
+
+function ensurePort() {
+  if (swPort) return swPort;
+  swPort = chrome.runtime.connect({ name: "si-subtitles" });
+  swPort.onDisconnect.addListener(() => {
+    swPort = null;
+    if (running) setTimeout(ensurePort, 500); // 会话仍在进行则重连
   });
+  return swPort;
+}
+
+function sendSubtitleToBackground(msg) {
+  try {
+    ensurePort().postMessage(msg);
+  } catch (e) {
+    // 端口异常时退回普通消息通道。
+    swPort = null;
+    try {
+      chrome.runtime.sendMessage(msg);
+    } catch {}
+  }
+}
+
+function wsConnected() {
+  return ws && ws.readyState === WebSocket.OPEN;
+}
+
+// ── 译文语音(TTS)播放 ───────────────────────────────────────────────
+// 后端把每句译文合成的音频(base64)经 WS 下发;这里顺序排队播放,避免重叠。
+let ttsNextTime = 0; // 下一句应开始播放的 AudioContext 时间
+
+function base64ToArrayBuffer(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+
+async function playTTSAudio(b64) {
+  if (!audioContext || !b64) return;
+  try {
+    const buf = await audioContext.decodeAudioData(base64ToArrayBuffer(b64));
+    const src = audioContext.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioContext.destination);
+    const now = audioContext.currentTime;
+    const startAt = Math.max(now, ttsNextTime);
+    src.start(startAt);
+    ttsNextTime = startAt + buf.duration; // 紧接上一句,顺序播放
+  } catch (e) {
+    console.error("[offscreen] TTS 播放失败", e);
+  }
+}
+
+function scheduleReconnect() {
+  if (!running) return;
+  if (reconnectTimer) return;
+  const delay = reconnectDelay;
+  console.warn(`[offscreen] WS 断开,${delay}ms 后重连`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    reconnectDelay = Math.min(reconnectDelay * RECONNECT.multiplier, RECONNECT.maxMs);
+    connectBackend();
+  }, delay);
+}
+
+function connectBackend() {
+  ws = new WebSocket(BACKEND_WS_URL);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    reconnectDelay = RECONNECT.initialMs; // 成功后重置退避。
+    // 告知后端音频参数与翻译方向(源→目标语言)。
+    ws.send(
+      JSON.stringify({
+        type: "start",
+        sourceLang: cfgSourceLang,
+        targetLang: cfgTargetLang,
+        audio: {
+          sampleRate: TARGET_SAMPLE_RATE,
+          bitDepth: 16,
+          channels: 1,
+          format: "pcm_s16le",
+        },
+      })
+    );
+    console.info("[offscreen] WS 已连接");
+  };
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data !== "string") return;
+    let msg;
+    try {
+      msg = JSON.parse(ev.data);
+    } catch {
+      return;
+    }
+    // 译文语音:直接在 offscreen 解码播放(不必经 background/页面)。
+    if (msg.type === "tts_audio") {
+      playTTSAudio(msg.audio);
+      return;
+    }
+    // 后端回传的字幕 / 翻译错误事件 -> 经常驻 Port 交给 background 转发到页面 overlay。
+    // 注意:用 channel 作路由键,绝不能复用 msg.target(那是译文,展开后会覆盖路由)。
+    if (msg.type === "subtitle" || msg.type === "translate_error" || msg.type === "lang_change") {
+      sendSubtitleToBackground({ channel: "page-subtitle", ...msg });
+    }
+  };
+
+  ws.onerror = () => {
+    // 错误后通常会触发 onclose,由 onclose 统一安排重连。
+  };
+
+  ws.onclose = () => {
+    ws = null;
+    scheduleReconnect();
+  };
 }
 
 async function start(streamId) {
-  await connectBackend();
+  if (running) stop(); // 幂等:先清理旧会话。
+  running = true;
+  reconnectDelay = RECONNECT.initialMs;
+  ttsNextTime = 0; // 重置译文语音播放时钟
+  ensurePort(); // 建立与 SW 的常驻连接(保活 + 字幕通道)
+  connectBackend();
 
   // 用 tab 媒体流 id 获取音频流。
   mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -54,22 +173,61 @@ async function start(streamId) {
   });
 
   audioContext = new AudioContext();
+  sourceNode = audioContext.createMediaStreamSource(mediaStream);
   // 关键:保持把标签页声音播放给用户(否则会静音)。
-  const source = audioContext.createMediaStreamSource(mediaStream);
-  source.connect(audioContext.destination);
+  sourceNode.connect(audioContext.destination);
 
-  // TODO(里程碑 2): 加载 audio-worklet.js,在 worklet 内重采样为 16kHz PCM,
-  // 通过 port 把分片回传到这里再经 ws.send 发送二进制帧。
-  // await audioContext.audioWorklet.addModule(chrome.runtime.getURL("audio-worklet.js"));
-  // workletNode = new AudioWorkletNode(audioContext, "pcm16k-downsampler");
-  // source.connect(workletNode);
-  // workletNode.port.onmessage = (e) => { if (ws?.readyState === 1) ws.send(e.data); };
+  // 加载重采样 worklet。
+  await audioContext.audioWorklet.addModule(chrome.runtime.getURL("audio-worklet.js"));
+  workletNode = new AudioWorkletNode(audioContext, "pcm16k-downsampler");
+  sourceNode.connect(workletNode);
+  // 接到 destination 以确保该节点被音频图拉动而持续 process(输出为静音)。
+  workletNode.connect(audioContext.destination);
+
+  workletNode.port.onmessage = (e) => {
+    // worklet 现在发两种消息:
+    //   - ArrayBuffer:一段 16kHz/16bit/单声道 PCM,直接走 WS 上传后端;
+    //   - {type:"vad", event:"silence"|"speech"}:本地 VAD 事件,转给页面字幕层
+    //     立即清屏(完全脱离 ASR 的判停延迟)。
+    if (e.data instanceof ArrayBuffer) {
+      if (wsConnected()) {
+        ws.send(e.data);
+      }
+      // 未连接时直接丢弃,避免积压、保持低延迟。
+      return;
+    }
+    if (e.data && e.data.type === "vad") {
+      sendSubtitleToBackground({
+        channel: "page-subtitle",
+        type: "vad",
+        event: e.data.event, // "silence" | "speech"
+      });
+    }
+  };
+
+  console.info("[offscreen] 采集已开始", { contextRate: audioContext.sampleRate });
 }
 
 function stop() {
+  running = false;
+  if (swPort) {
+    try {
+      swPort.disconnect();
+    } catch {}
+    swPort = null;
+  }
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
   if (workletNode) {
+    workletNode.port.onmessage = null;
     workletNode.disconnect();
     workletNode = null;
+  }
+  if (sourceNode) {
+    sourceNode.disconnect();
+    sourceNode = null;
   }
   if (mediaStream) {
     mediaStream.getTracks().forEach((t) => t.stop());
@@ -81,8 +239,9 @@ function stop() {
   }
   if (ws) {
     try {
-      ws.send(JSON.stringify({ type: "stop" }));
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "stop" }));
     } catch {}
+    ws.onclose = null; // 主动停止,不再触发重连。
     ws.close();
     ws = null;
   }
@@ -91,8 +250,26 @@ function stop() {
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.target !== "offscreen") return;
   if (msg.type === "start") {
+    cfgSourceLang = msg.sourceLang || "";
+    cfgTargetLang = msg.targetLang || "中文";
     start(msg.streamId).catch((err) => console.error("[offscreen] start failed", err));
   } else if (msg.type === "stop") {
     stop();
+  } else if (msg.type === "config") {
+    // 翻译进行中切换源/目标语言:更新本地记忆(供 WS 重连后沿用),
+    // 并立即通过 WS 通知后端 session 热更新。
+    if (typeof msg.sourceLang === "string") cfgSourceLang = msg.sourceLang;
+    if (msg.targetLang) cfgTargetLang = msg.targetLang;
+    if (wsConnected()) {
+      try {
+        ws.send(
+          JSON.stringify({
+            type: "config",
+            sourceLang: cfgSourceLang,
+            targetLang: cfgTargetLang,
+          })
+        );
+      } catch {}
+    }
   }
 });

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI 同声传译助手(火山引擎版)",
-  "version": "0.1.0",
+  "version": "0.2.2",
   "description": "实时把标签页中的外语音频翻译为中文双语字幕(可选 TTS),具备自动纠错能力。",
   "permissions": [
     "tabCapture",
@@ -11,7 +11,7 @@
     "storage"
   ],
   "host_permissions": [
-    "http://localhost/*",
+    "<all_urls>",
     "ws://localhost/*"
   ],
   "background": {
@@ -19,14 +19,22 @@
     "type": "module"
   },
   "action": {
-    "default_title": "同声传译",
-    "default_popup": "popup.html"
+    "default_title": "同声传译(点击或按 Alt+Shift+S 开始/停止)"
+  },
+  "commands": {
+    "toggle-translation": {
+      "suggested_key": {
+        "default": "Alt+Shift+S",
+        "mac": "Alt+Shift+S"
+      },
+      "description": "开始/停止同声传译"
+    }
   },
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content.js"],
       "css": ["overlay.css"],
+      "js": ["content.js"],
       "run_at": "document_idle"
     }
   ],

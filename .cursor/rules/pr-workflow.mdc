@@ -1,0 +1,26 @@
+---
+description: Always deliver completed steps via a Pull Request
+alwaysApply: true
+---
+
+# PR-Based Delivery Workflow
+
+Whenever the user asks me to complete a step/task and I finish it, I MUST deliver
+it as a Pull Request rather than committing directly to `main`.
+
+## Required steps after finishing a task
+
+1. Create (or switch to) a dedicated feature branch, e.g. `feat/<short-name>` or
+   `fix/<short-name>`. Never commit the work directly on `main`.
+2. Commit the changes with a clear, conventional message (e.g. `feat: ...`,
+   `fix: ...`, `chore: ...`).
+3. Push the branch: `git push -u origin <branch>`.
+4. Open a PR with `gh pr create`, providing a `## Summary` and `## Test plan`.
+5. Return the PR URL to the user.
+
+## Notes
+
+- One PR per completed step the user requests.
+- Keep `main` clean; all work lands through PRs.
+- If pushing to GitHub fails with a network error (e.g. `Connection was reset`),
+  report it and offer proxy/SSH remedies instead of silently giving up.

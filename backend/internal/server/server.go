@@ -1,9 +1,9 @@
-// Package server 实现前端扩展 <-> 后端的 WebSocket 中继骨架。
+// Package server 实现前端扩展 <-> 后端的 WebSocket 中继。
 //
-// 里程碑 1 仅打通「空链路」:
 //   - 启动 HTTP 服务,提供 /healthz 健康检查;
-//   - 提供 /ws,接受前端连接,接收音频二进制分片与文本控制消息并记录日志;
-//   - 预留 ASR -> 翻译 -> TTS 的串联位置(后续里程碑填充)。
+//   - 提供 /ws,接受前端连接,接收音频二进制分片与文本控制消息;
+//   - 为每个会话建立上游火山 ASR 连接,转发 PCM,并把识别结果(partial/final)
+//     作为字幕事件回发前端。翻译 -> TTS 在后续里程碑填充。
 package server
 
 import (
@@ -78,9 +78,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// clientMessage 是前端通过文本帧发送的控制消息结构(后续里程碑扩展)。
+// clientMessage 是前端通过文本帧发送的控制消息结构。
 type clientMessage struct {
-	Type string `json:"type"` // 例如 "start" / "stop" / "config"
+	Type       string `json:"type"`       // 例如 "start" / "stop" / "config"
+	SourceLang string `json:"sourceLang"` // 源语言提示(空/"自动检测" = 自动)
+	TargetLang string `json:"targetLang"` // 目标语言(翻译成什么语言)
 }
 
 // handleWS 处理一条前端连接的完整生命周期。
@@ -93,13 +95,14 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	sessionID := uuid.NewString()
 	log := s.log.With(slog.String("session", sessionID))
 	log.Info("client connected", slog.String("remote", r.RemoteAddr))
+
+	sess := newSession(r.Context(), sessionID, log, conn)
+	sess.start() // 后台建立上游 ASR 连接(含自动重连)
 	defer func() {
+		sess.close()
 		_ = conn.Close()
 		log.Info("client disconnected")
 	}()
-
-	// TODO(里程碑 3+): 在此为每个 session 建立 ASR 连接,
-	// 并把 ASR -> 翻译 -> TTS 的处理管线挂上来。
 
 	var (
 		audioFrames int
@@ -116,16 +119,19 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 		switch msgType {
 		case websocket.BinaryMessage:
-			// 二进制 = 16kHz/16bit/单声道 PCM 音频分片。
+			// 二进制 = 16kHz/16bit/单声道 PCM 音频分片,转发给上游 ASR。
 			audioFrames++
 			audioBytes += len(data)
 			if audioFrames%50 == 0 { // 节流日志,约每 5 秒打印一次
+				// 按 16kHz/16bit/单声道估算已接收音频时长,便于核对采样率是否正确。
+				seconds := float64(audioBytes) / float64(config.AudioSampleRate*(config.AudioBitDepth/8)*config.AudioChannels)
 				log.Debug("audio received",
 					slog.Int("frames", audioFrames),
 					slog.Int("bytes", audioBytes),
+					slog.Float64("approx_seconds", seconds),
 				)
 			}
-			// TODO(里程碑 3): 转发 PCM 到 ASR 上游连接。
+			sess.sendAudio(data)
 
 		case websocket.TextMessage:
 			var m clientMessage
@@ -133,9 +139,15 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				log.Warn("bad control message", slog.String("raw", string(data)))
 				continue
 			}
-			log.Info("control message", slog.String("type", m.Type))
-			// 里程碑 1:回个 ack,验证双向通路。
-			_ = conn.WriteJSON(map[string]any{"type": "ack", "of": m.Type})
+			log.Info("control message",
+				slog.String("type", m.Type),
+				slog.String("source_lang", m.SourceLang),
+				slog.String("target_lang", m.TargetLang),
+			)
+			if m.Type == "start" || m.Type == "config" {
+				sess.setLanguages(m.SourceLang, m.TargetLang)
+			}
+			sess.writeJSON(map[string]any{"type": "ack", "of": m.Type})
 		}
 	}
 }

@@ -1,0 +1,299 @@
+// Package config 集中存放本项目的全部配置。
+//
+// 【使用方法】本文件是模板。请复制为同目录下的 config.go 再填入真实密钥:
+//
+//	cp config.go.example config.go      # Windows: copy config.go.example config.go
+//
+// config.go 已被 .gitignore 忽略,不会进入版本库,以免明文密钥泄露到公开仓库。
+// 按需求,所有密钥与可调参数都以「常量 / 包级变量」的形式写死在 config.go 中,
+// 不读取环境变量,也不读取 .env 文件。
+//
+// 注意:本模板文件名以 .example 结尾,Go 编译器会忽略它,因此不会与 config.go 冲突。
+package config
+
+import "time"
+
+// ───────────────────────────────────────────────────────────────────────────
+// ASR —— 火山引擎「大模型流式语音识别」(BigModel SAUC)
+// ───────────────────────────────────────────────────────────────────────────
+const (
+	// UseNewConsoleAuth 控制鉴权方式:
+	//   true  = 新版控制台:仅需 X-Api-Key(见 SpeechAPIKey),ASR/TTS 共用;
+	//   false = 旧版控制台:使用 X-Api-App-Key + X-Api-Access-Key。
+	UseNewConsoleAuth = true
+
+	// SpeechAPIKey 新版控制台的统一鉴权 Key(请求头 X-Api-Key),语音识别/合成共用。
+	// 仅当 UseNewConsoleAuth = true 时使用。
+	SpeechAPIKey = "PLEASE_FILL_SPEECH_API_KEY" // TODO: 填入真实 API Key
+
+	// ASRAppKey 对应请求头 X-Api-App-Key(旧版控制台)。
+	ASRAppKey = "PLEASE_FILL_ASR_APP_KEY" // TODO: 旧版控制台填入 App ID
+
+	// ASRAccessKey 对应请求头 X-Api-Access-Key(旧版控制台)。
+	ASRAccessKey = "PLEASE_FILL_ASR_ACCESS_KEY" // TODO: 旧版控制台填入 Access Token
+
+	// ASRResourceID 对应请求头 X-Api-Resource-Id,固定值,无需改动。
+	ASRResourceID = "volc.bigasr.sauc.duration"
+
+	// ASRWebSocketURL 双向流式 ASR(旧版,保留兼容)。
+	ASRWebSocketURL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
+
+	// ASRWebSocketURLAsync 双向流式优化版:英/中/自动检测使用(与英→中同款)。
+	ASRWebSocketURLAsync = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
+
+	// ASRWebSocketURLNostream 流式输入模式:日/韩/俄/法/德/西/粤等显式源语言使用。
+	ASRWebSocketURLNostream = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream"
+
+	// ASRModelName 模型名称,目前固定为 bigmodel。
+	ASRModelName = "bigmodel"
+)
+
+// ASRRequestConfig 控制 ASR 识别行为(写死的默认值,详见火山文档)。
+type ASRRequestConfig struct {
+	EnableITN      bool   // 文本规范化(如「一九七零年」->「1970年」)
+	EnablePunc     bool   // 标点
+	EnableDDC      bool   // 语义顺滑(去口头语/重复)
+	ShowUtterances bool   // 输出分句信息(text/start_time/end_time/definite)
+	ResultType     string // "full"=全量返回;"single"=增量返回
+	EnableNonstream bool  // async 端点:实时逐字+停顿后二遍精修(英→中同款)
+	EndWindowSize         int // async 判停(ms)
+	EndWindowSizeNostream int // nostream 判停(ms);其他语种 ASR
+}
+
+// ASRRequest 当前生效的 ASR 识别参数。
+var ASRRequest = ASRRequestConfig{
+	EnableITN:      true,
+	EnablePunc:     true,
+	EnableDDC:      false,
+	ShowUtterances: true,
+	ResultType:            "full",
+	EnableNonstream:       true,
+	EndWindowSize:         150,
+	EndWindowSizeNostream: 250,
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// TTS —— 火山引擎「大模型语音合成 双向流式 V3」(里程碑 7,可开关)
+// ───────────────────────────────────────────────────────────────────────────
+const (
+	// TTSAppKey / TTSAccessKey 与 ASR 共用同一套鉴权。
+	TTSAppKey    = ASRAppKey
+	TTSAccessKey = ASRAccessKey
+
+	// TTSResourceID 对应请求头 X-Api-Resource-Id,固定值,无需改动。
+	TTSResourceID = "volc.service_type.10029"
+
+	// TTSVoiceType 中文音色,取值来自控制台「音色列表」。
+	TTSVoiceType = "PLEASE_FILL_TTS_VOICE_TYPE" // TODO: 填入真实中文音色
+
+	// TTSHost / TTSPath 双向流式合成接入信息。
+	TTSHost = "openspeech.bytedance.com"
+	TTSPath = "/api/v3/tts/bidirection"
+
+	// TTSWebSocketURL 大模型语音合成「双向流式 V3」的 WebSocket 接入地址。
+	TTSWebSocketURL = "wss://" + TTSHost + TTSPath
+
+	// TTSNamespace 双向流式命名空间,固定值。
+	TTSNamespace = "BidirectionalTTS"
+)
+
+// TTSConfig 控制「译文转语音」(里程碑 7,可开关)。
+type TTSConfig struct {
+	// Enable 总开关:关闭时完全不合成语音(默认关闭)。
+	Enable bool
+
+	// Format 音频编码:前端用 Web Audio decodeAudioData 播放,mp3 最省事。
+	Format string
+
+	// SampleRate 合成采样率(Hz)。
+	SampleRate int
+
+	// Timeout 单句合成(建连->收完音频)的整体超时。
+	Timeout time.Duration
+}
+
+// TTS 当前生效的语音合成配置(写死的默认值)。
+// 注意:Enable 默认关闭,且需先把 TTSVoiceType 填成真实音色才会真正合成。
+var TTS = TTSConfig{
+	Enable:     false,
+	Format:     "mp3",
+	SampleRate: 24000,
+	Timeout:    20 * time.Second,
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 翻译 —— 火山方舟 Ark(OpenAI 兼容)
+// ───────────────────────────────────────────────────────────────────────────
+const (
+	// ArkAPIKey 作为 Bearer Token 使用。
+	ArkAPIKey = "PLEASE_FILL_ARK_API_KEY" // TODO: 填入真实 API Key
+
+	// ArkModel 模型 / 接入点 ID(如 doubao 系列的 endpoint id 或模型名)。
+	ArkModel = "PLEASE_FILL_ARK_MODEL_OR_ENDPOINT_ID" // TODO: 填入真实接入点/模型
+
+	// ArkEndpoint Chat Completions 接口地址(如地域不同请自行修改)。
+	ArkEndpoint = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+)
+
+// ───────────────────────────────────────────────────────────────────────────
+// 服务端 / 中继
+// ───────────────────────────────────────────────────────────────────────────
+const (
+	// ListenAddr 后端 WebSocket 中继监听地址。
+	ListenAddr = "0.0.0.0:8765"
+
+	// ClientWSPath 前端扩展连接后端的 WebSocket 路径。
+	ClientWSPath = "/ws"
+
+	// HealthPath 健康检查路径。
+	HealthPath = "/healthz"
+)
+
+// ───────────────────────────────────────────────────────────────────────────
+// 翻译目标语言 & 分句
+// ───────────────────────────────────────────────────────────────────────────
+const (
+	// TargetLanguage 目标语言,本项目固定翻译为中文。
+	TargetLanguage = "中文"
+)
+
+// TranslateConfig 控制方舟(Ark)翻译的行为。
+type TranslateConfig struct {
+	// ContextWindow 翻译时携带的上下文(最近 N 段「原文 => 译文」),
+	// 用于保持术语、人名与语气一致。
+	ContextWindow int
+
+	// Timeout 单次翻译请求的超时时间。
+	Timeout time.Duration
+
+	// Temperature 采样温度,低温更稳定、更贴近直译。
+	Temperature float64
+
+	// MaxTokens 译文最大长度;0 表示不显式限制。
+	MaxTokens int
+
+	// PartialPreview 开启「边说边译」:对说话中(partial)的句子也实时翻译,
+	// 句子定稿后再用带上下文的正式译文原地覆盖。关闭则只翻译定稿句子。
+	PartialPreview bool
+
+	// PartialMinChars 触发一次 partial 重译所需的最小原文增量(按字符/rune 计):
+	// 原文相比上次送译至少多出这么多字才再次翻译,避免逐字刷接口。
+	PartialMinChars int
+
+	// PartialMinInterval 同一句两次 partial 翻译之间的最小时间间隔。
+	PartialMinInterval time.Duration
+}
+
+// Translate 当前生效的翻译配置(写死的默认值)。
+var Translate = TranslateConfig{
+	ContextWindow:      3, // 上下文从 5 降到 3:更短的提示词 -> 更快返回译文(略微牺牲长距一致性)
+	Timeout:            20 * time.Second,
+	Temperature:        0.3,
+	MaxTokens:          256, // 单句译文足够;上限收紧让生成更快收尾
+	PartialPreview:     true,
+	PartialMinChars:    2,                      // 每多 2 字就送译,边说边译跟得更紧
+	PartialMinInterval: 140 * time.Millisecond, // partial 译文刷新节流间隔(缩短:正在说的内容跟得更紧)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 术语表 / 领域提示词(里程碑 8)
+// ───────────────────────────────────────────────────────────────────────────
+
+// PromptConfig 定制翻译与复审的「领域背景」与「术语对照」。
+// 两者都会注入到翻译 / 复审的系统提示词中,用来稳定专有名词与译法一致性。
+type PromptConfig struct {
+	// Domain 领域 / 场景背景描述(自由文本)。例如:
+	//   "一场关于机器学习与大语言模型的技术分享,讲者会频繁使用深度学习术语"。
+	// 留空表示不附加领域背景。
+	Domain string
+
+	// Glossary 术语对照表:原文词条 => 指定译法。命中时必须采用指定译法,
+	// 用于锁定人名、产品名、专业术语的统一翻译。留空表示不启用术语表。
+	Glossary map[string]string
+}
+
+// Prompt 当前生效的术语表 / 领域提示词(默认均为空,不改变既有翻译行为)。
+// 按需在此填入领域背景与术语,例如:
+//
+//	var Prompt = PromptConfig{
+//	    Domain: "一场关于机器学习的技术分享",
+//	    Glossary: map[string]string{
+//	        "transformer": "Transformer 架构",
+//	        "attention":   "注意力机制",
+//	    },
+//	}
+var Prompt = PromptConfig{
+	Domain:   "",
+	Glossary: map[string]string{},
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 纠错策略(本项目核心,做成可配置)
+// ───────────────────────────────────────────────────────────────────────────
+
+// CorrectionConfig 定义两层纠错能力的开关与参数。
+type CorrectionConfig struct {
+	// EnableASRRevision 开启「ASR 修订重译」:当 ASR 对已 final 的早先片段
+	// 返回修订时,把该 segment 标记为 dirty 并重新翻译、原地替换。
+	EnableASRRevision bool
+
+	// EnablePeriodicReview 开启「周期性 LLM 复审」:带最近 N 段上下文,
+	// 让 LLM 用后文澄清的信息校正早先译文。
+	EnablePeriodicReview bool
+
+	// ReviewContextWindow 复审滑动窗口大小(最近 N 段「原文+译文」)。
+	ReviewContextWindow int
+
+	// ReviewInterval 周期性复审的时间间隔(到句子边界或每隔该时间触发一次)。
+	ReviewInterval time.Duration
+
+	// OverwriteOnlyIfMoreConfident 仅当复审「确信改得更准」时才覆盖旧译文。
+	// 开启后,复审返回的每句修订都带一个 confidence(0~1),只有
+	// confidence >= ReviewMinConfidence 且模型确实标记 changed 的句子才会被替换,
+	// 从而避免「把本来正确的句子改成另一种同义说法」的过度纠错(那只会让字幕闪烁)。
+	OverwriteOnlyIfMoreConfident bool
+
+	// ReviewMinConfidence 应用一条复审修订所需的最低置信度(0~1)。
+	// 仅在 OverwriteOnlyIfMoreConfident=true 时生效。调高=更保守,调低=更激进。
+	ReviewMinConfidence float64
+}
+
+// Correction 当前生效的纠错配置(写死的默认值)。
+var Correction = CorrectionConfig{
+	EnableASRRevision:            true,
+	EnablePeriodicReview:         true,
+	ReviewContextWindow:          5,
+	ReviewInterval:               1200 * time.Millisecond, // 定时兜底降到 1.2s;主路径是「每句定稿即触发复审」,两者叠加让修订尽快闪现
+	OverwriteOnlyIfMoreConfident: true,
+	ReviewMinConfidence:          0.6,
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 连接 / 重连 / 节流
+// ───────────────────────────────────────────────────────────────────────────
+
+// ReconnectConfig 断线自动重连(指数退避)参数。
+type ReconnectConfig struct {
+	InitialBackoff time.Duration // 初始退避
+	MaxBackoff     time.Duration // 最大退避
+	Multiplier     float64       // 退避倍数
+	MaxRetries     int           // 最大重试次数,0 表示无限重试
+}
+
+// Reconnect 当前生效的重连配置。
+var Reconnect = ReconnectConfig{
+	InitialBackoff: 500 * time.Millisecond,
+	MaxBackoff:     15 * time.Second,
+	Multiplier:     2.0,
+	MaxRetries:     0,
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 音频参数(需与前端采集保持一致)
+// ───────────────────────────────────────────────────────────────────────────
+const (
+	AudioSampleRate = 16000 // 16kHz
+	AudioBitDepth   = 16    // 16bit
+	AudioChannels   = 1     // 单声道
+	AudioChunkMs    = 100   // 约 100ms 一片
+)
