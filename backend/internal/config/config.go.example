@@ -11,7 +11,10 @@
 // 注意:本模板文件名以 .example 结尾,Go 编译器会忽略它,因此不会与 config.go 冲突。
 package config
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // ───────────────────────────────────────────────────────────────────────────
 // ASR —— 火山引擎「大模型流式语音识别」(BigModel SAUC)
@@ -131,6 +134,10 @@ const (
 	// ArkModel 模型 / 接入点 ID(如 doubao 系列的 endpoint id 或模型名)。
 	ArkModel = "PLEASE_FILL_ARK_MODEL_OR_ENDPOINT_ID" // TODO: 填入真实接入点/模型
 
+	// ArkPartialModel 预览(partial)翻译用的模型;留空或 PLEASE_FILL 则与 ArkModel 相同。
+	// 可填更快的 lite 接入点,降低边说边译首字延迟(定稿仍走 ArkModel)。
+	ArkPartialModel = ""
+
 	// ArkEndpoint Chat Completions 接口地址(如地域不同请自行修改)。
 	ArkEndpoint = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 )
@@ -182,6 +189,25 @@ type TranslateConfig struct {
 
 	// PartialMinInterval 同一句两次 partial 翻译之间的最小时间间隔。
 	PartialMinInterval time.Duration
+
+	// PartialTemperature 预览翻译采样温度;0 表示沿用 Temperature。
+	PartialTemperature float64
+
+	// PartialMaxTokens 预览译文最大 token;0 表示代码内默认 128。
+	PartialMaxTokens int
+
+	// FinalWorkers 定稿翻译并发 worker 数(>=1)。
+	FinalWorkers int
+
+	// PartialPromoteWait 定稿时若尚无 partial 预览,最多等待多久(0=不等待)。
+	// 各语种可在 segment 策略里覆盖。
+	PartialPromoteWait time.Duration
+
+	// RefinePromoted 预览秒升定稿后,是否后台再用 Pro 模型静默精修。
+	RefinePromoted bool
+
+	// RefineDelay 后台精修前额外等待(0=立即)。
+	RefineDelay time.Duration
 }
 
 // Translate 当前生效的翻译配置(写死的默认值)。
@@ -191,8 +217,14 @@ var Translate = TranslateConfig{
 	Temperature:        0.3,
 	MaxTokens:          256, // 单句译文足够;上限收紧让生成更快收尾
 	PartialPreview:     true,
-	PartialMinChars:    2,                      // 每多 2 字就送译,边说边译跟得更紧
-	PartialMinInterval: 140 * time.Millisecond, // partial 译文刷新节流间隔(缩短:正在说的内容跟得更紧)
+	PartialMinChars:      2,                      // 每多 2 字就送译,边说边译跟得更紧
+	PartialMinInterval:   140 * time.Millisecond, // partial 译文刷新节流间隔(缩短:正在说的内容跟得更紧)
+	PartialTemperature:   0,                      // 0=沿用 Temperature
+	PartialMaxTokens:     128,
+	FinalWorkers:         1,
+	PartialPromoteWait:   0,
+	RefinePromoted:       true,
+	RefineDelay:          0,
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -297,3 +329,19 @@ const (
 	AudioChannels   = 1     // 单声道
 	AudioChunkMs    = 100   // 约 100ms 一片
 )
+
+// TTSVoiceFor 按目标语言返回 TTS 音色 ID;未配置或占位符时返回空(跳过合成)。
+func TTSVoiceFor(lang string) string {
+	if !TTS.Enable {
+		return ""
+	}
+	v := strings.TrimSpace(TTSVoiceType)
+	if v == "" || strings.HasPrefix(v, "PLEASE_FILL") {
+		return ""
+	}
+	lang = strings.TrimSpace(lang)
+	if lang == "" || lang == TargetLanguage || lang == "中文" {
+		return v
+	}
+	return ""
+}
