@@ -1,5 +1,5 @@
 // Package translate 通过火山方舟(Ark, OpenAI 兼容的 Chat Completions 接口)
-// 把 ASR 识别出的外语原文翻译成目标语言(本项目固定为中文)。
+// 把 ASR 识别出的原文翻译成用户指定的目标语言。
 //
 // 设计要点:
 //   - 仅依赖 config 中写死的 ArkAPIKey / ArkModel / ArkEndpoint;
@@ -109,10 +109,10 @@ func writeDomainAndGlossary(sb *strings.Builder) {
 
 // resolveTarget 返回有效目标语言:为空时回退到默认(config.TargetLanguage)。
 func resolveTarget(target string) string {
-	if t := strings.TrimSpace(target); t != "" {
+	if t := NormalizeLang(target); t != "" {
 		return t
 	}
-	return config.TargetLanguage
+	return NormalizeLang(config.TargetLanguage)
 }
 
 // buildSystemPrompt 组装系统提示词,翻译目标语言为 target;source 为源语言提示
@@ -129,11 +129,23 @@ func buildSystemPrompt(target, source string) string {
 	sb.WriteString("3. 译文要自然流畅、符合")
 	sb.WriteString(target)
 	sb.WriteString("的口语表达习惯;\n")
-	sb.WriteString("4. 即使原文是一句话的片段也请给出通顺的部分译文,不要补全臆测的内容。\n")
-	if s := strings.TrimSpace(source); s != "" {
-		sb.WriteString("5. 原文语言为")
+	sb.WriteString("4. 即使原文是一句话的片段也请给出通顺的部分译文,不要补全臆测的内容;\n")
+	sb.WriteString("5. 【语言硬性要求】输出必须全部使用")
+	sb.WriteString(target)
+	sb.WriteString("书写,严禁夹杂、混用或与目标语言无关的其他语言文字(国际通用缩写、无法避免的专有名词除外);\n")
+	sb.WriteString("6. 目标语言是")
+	sb.WriteString(target)
+	sb.WriteString(",无论原文是什么语言,最终字幕只能是")
+	sb.WriteString(target)
+	sb.WriteString("。\n")
+	if s := NormalizeLang(source); s != "" {
+		sb.WriteString("7. 原文语言为")
 		sb.WriteString(s)
-		sb.WriteString(",请据此正确理解原文。\n")
+		if LangsEquivalent(source, target) {
+			sb.WriteString(",与目标语言相同:请主要做口语化润色与 ASR 错字纠正,不要翻译成其他语言。\n")
+		} else {
+			sb.WriteString(",请据此正确理解原文。\n")
+		}
 	}
 	writeDomainAndGlossary(&sb)
 	return sb.String()
@@ -331,9 +343,9 @@ func buildReviewSystemPrompt(n int, target string) string {
 	sb.WriteString("⑥ 过早翻译导致的语序/结构错误:边说边译时前半句可能被误解,后文补全后修正为通顺表达;\n")
 	sb.WriteString("⑦ 一词多义/歧义:后文确定词义后修正(如 Apple 公司 vs 苹果)。\n")
 	sb.WriteString("【保守原则】没有问题的句子一律保持原译文不变、changed 置为 false;只在确有改进时才修改。宁可不改,也不要把已经正确、通顺的句子改成同义的另一种说法(那只会让字幕无谓闪烁)。\n")
-	sb.WriteString("译文须自然流畅、符合")
+	sb.WriteString("译文须自然流畅、全部使用")
 	sb.WriteString(target)
-	sb.WriteString("口语习惯,且只对应该句原文,不要合并、拆分或臆测补全。\n")
+	sb.WriteString("书写,严禁混用其他语言,且只对应该句原文,不要合并、拆分或臆测补全。\n")
 	sb.WriteString(fmt.Sprintf("【输出格式】严格只输出一个 JSON 数组,长度必须为 %d,按 index 升序排列,每个元素是对象:\n", n))
 	sb.WriteString("{\"index\": 该句序号, \"target\": \"修订后译文(没改就原样返回原译文)\", \"changed\": true/false(是否做了实质修改), \"confidence\": 0~1 的数字(你对『本次修改确实更准确』的把握;changed=false 时填 1)}\n")
 	sb.WriteString("不要输出任何额外文字、Markdown 代码块、解释或注释。")

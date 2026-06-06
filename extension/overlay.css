@@ -2,10 +2,10 @@
  *
  * 借鉴 YouTube / 系统实时字幕:屏幕底部一条固定的字幕条,左对齐、自然换行、
  * 固定 2 行高度 + 底部锚定竖直滚动(JS 把 scrollTop 锁在底部),文字只在末尾追加、
- * 不左右横移,旧内容向上滚出视野。
+ * 不左右横移,旧内容向上滚出视野;上方四向箭头拖动,文字区选中复制。
  *   - .si-committed:已定稿(final)部分,饱满白色;
  *   - .si-tentative:当前说话中(partial)部分,接在末尾,略微弱化提示"还在变";
- *   - .si-corrected:刚被自动纠正(ASR 修订 / LLM 复审)的那一段,短暂淡出高亮。
+ *   - .si-corrected:曾被自动纠正(ASR 修订 / LLM 复审)的那一段,绿色长亮标记。
  */
 
 #__simul_interpreter_overlay__ {
@@ -40,7 +40,59 @@
   display: none;
 }
 
+/* 字幕条 + 上方拖动手柄纵向排列 */
+#__simul_interpreter_overlay__ .si-caption-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+}
+
+/* 上方四向箭头把手:专用于拖动,尺寸适中不挡画面 */
+#__simul_interpreter_overlay__ .si-caption-move {
+  width: 34px;
+  height: 24px;
+  margin: 0 0 5px;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.78);
+  color: rgba(255, 255, 255, 0.82);
+  cursor: grab;
+  touch-action: none;
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  opacity: 0.72;
+  transition: opacity 120ms ease, color 120ms ease, background 120ms ease;
+}
+
+#__simul_interpreter_overlay__ .si-caption-move:hover {
+  opacity: 1;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.88);
+}
+
+#__simul_interpreter_overlay__ .si-caption-stack.si-dragging .si-caption-move {
+  cursor: grabbing;
+  opacity: 1;
+  color: #7cc6ff;
+  box-shadow: 0 0 0 2px rgba(124, 198, 255, 0.55);
+}
+
+#__simul_interpreter_overlay__ .si-caption-stack.si-dragging .si-caption {
+  box-shadow: 0 0 0 2px rgba(124, 198, 255, 0.35);
+}
+
+/* 锁定时隐藏拖动手柄 */
+#__simul_interpreter_overlay__ .si-caption-stack.si-locked .si-caption-move {
+  display: none;
+}
+
 #__simul_interpreter_overlay__ .si-caption {
+  width: 100%;
   background: rgba(0, 0, 0, 0.78);
   color: var(--si-caption-color, #ffffff);
   padding: 10px 18px;
@@ -59,12 +111,17 @@
   scrollbar-width: thin; /* Firefox 细滚动条 */
   scrollbar-color: rgba(255, 255, 255, 0.4) transparent;
   word-break: break-word;
-  /* 允许字幕条本身被拖动到任意位置 */
   pointer-events: auto;
-  cursor: grab;
-  touch-action: none;
-  -webkit-user-select: none;
-  user-select: none;
+  cursor: text;
+  touch-action: manipulation;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* 选中高亮:深色底上用浅蓝,复制时更易辨认 */
+#__simul_interpreter_overlay__ .si-caption ::selection {
+  background: rgba(124, 198, 255, 0.55);
+  color: #fff;
 }
 
 /* WebKit(Chrome/Edge)细滚动条:半透明,不抢戏 */
@@ -77,12 +134,6 @@
 }
 #__simul_interpreter_overlay__ .si-caption::-webkit-scrollbar-track {
   background: transparent;
-}
-
-#__simul_interpreter_overlay__ .si-caption.si-dragging {
-  cursor: grabbing;
-  /* 拖动时让外框略亮一点,暗示「我正在跟手」 */
-  box-shadow: 0 0 0 2px rgba(124, 198, 255, 0.55);
 }
 
 /* 字幕右上角的锁图标:点一下锁定拖动,再点解锁 */
@@ -118,15 +169,18 @@
   color: #06210f;
 }
 
-/* 锁定时字幕不再显示「可抓取」光标 */
-#__simul_interpreter_overlay__ .si-caption.si-locked {
-  cursor: default;
-}
-
 /* committed / tentative 都继承字幕主色;tentative 半透明 + 斜体表达「还在变」。 */
 #__simul_interpreter_overlay__ .si-committed,
 #__simul_interpreter_overlay__ .si-tentative {
   color: inherit;
+  cursor: text;
+}
+
+/* 曾被自动纠正的句子:绿色底色长亮,不再淡出 */
+#__simul_interpreter_overlay__ .si-corrected {
+  background-color: rgba(86, 214, 132, 0.55);
+  border-radius: 5px;
+  padding: 0 3px;
 }
 
 #__simul_interpreter_overlay__ .si-tentative {
@@ -141,14 +195,6 @@
   font-style: normal;
   opacity: 0.85;
   animation: si-caret-blink 1s steps(2, start) infinite;
-}
-
-/* 刚被自动纠正的句子:JS 按淡出强度把底色写到 style.backgroundColor 上,
- * 这里只负责把高亮做成一个圆角小药丸,并让相邻两帧的色值过渡得更顺滑。 */
-#__simul_interpreter_overlay__ .si-corrected {
-  border-radius: 5px;
-  padding: 0 3px;
-  transition: background-color 90ms linear;
 }
 
 @keyframes si-caret-blink {
@@ -452,4 +498,35 @@
   color: #888;
   border-top: 1px solid #eee;
   padding-top: 8px;
+}
+
+/* 无声音自动停止:开关 + 秒数输入 */
+#__simul_interpreter_pet__ .si-pet-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #444;
+  cursor: pointer;
+}
+
+#__simul_interpreter_pet__ .si-pet-check input {
+  margin: 0;
+  cursor: pointer;
+}
+
+#__simul_interpreter_pet__ .si-pet-silence-row input {
+  width: 52px;
+  padding: 4px 6px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  font-size: 12px;
+  background: #fff;
+  color: #1b2433;
+  text-align: center;
+}
+
+#__simul_interpreter_pet__ .si-pet-silence-row.si-disabled {
+  opacity: 0.45;
+  pointer-events: none;
 }

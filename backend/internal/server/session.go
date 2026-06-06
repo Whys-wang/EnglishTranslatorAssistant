@@ -56,6 +56,7 @@ type session struct {
 	langMu  sync.RWMutex
 	srcLang string
 	tgtLang string
+	langGen uint64 // 每次变更语言 +1,用于丢弃切换前已在途的译文
 
 	// 记录每个 segment 上一次下发的原文,用于去重(避免无变化的重复推送)。
 	segMu         sync.Mutex
@@ -115,20 +116,93 @@ func newSession(parent context.Context, id string, log *slog.Logger, conn *webso
 	return s
 }
 
-// setLanguages 设置翻译方向(由前端 start 消息携带)。
+// setLanguages 设置翻译方向(由前端 start/config 消息携带)。
 // src 为源语言提示(空/"自动检测" 视为自动);tgt 为目标语言(空则保持默认)。
+// 方向变化时会清空已有译文缓存,避免旧语言的上下文污染新字幕。
 func (s *session) setLanguages(src, tgt string) {
-	s.langMu.Lock()
-	defer s.langMu.Unlock()
-	src = strings.TrimSpace(src)
-	if src == "自动检测" || src == "auto" {
-		src = ""
+	newSrc := translate.NormalizeLang(src)
+	newTgt := s.tgtLang
+	if t := translate.NormalizeLang(tgt); t != "" {
+		newTgt = t
 	}
-	s.srcLang = src
-	if t := strings.TrimSpace(tgt); t != "" {
-		s.tgtLang = t
+
+	s.langMu.Lock()
+	changed := newSrc != s.srcLang || newTgt != s.tgtLang
+	s.srcLang = newSrc
+	s.tgtLang = newTgt
+	s.langMu.Unlock()
+
+	if changed {
+		s.bumpLangGen()
+		s.resetTranslationState()
+		s.requeueAllSegments()
+		s.notifyLanguageChange()
 	}
 	s.log.Info("languages set", slog.String("source", s.srcLang), slog.String("target", s.tgtLang))
+}
+
+func (s *session) bumpLangGen() {
+	s.langMu.Lock()
+	s.langGen++
+	s.langMu.Unlock()
+}
+
+func (s *session) currentLangGen() uint64 {
+	s.langMu.RLock()
+	defer s.langMu.RUnlock()
+	return s.langGen
+}
+
+// notifyLanguageChange 通知前端立刻清空当前字幕,等待新语言译文回填。
+func (s *session) notifyLanguageChange() {
+	src, tgt := s.languages()
+	s.writeJSON(map[string]any{
+		"type":       "lang_change",
+		"sourceLang": src,
+		"targetLang": tgt,
+	})
+}
+
+// requeueAllSegments 语言切换后,把已有原文的句子全部重新送入翻译队列。
+func (s *session) requeueAllSegments() {
+	if !s.trEnabled {
+		return
+	}
+	s.segMu.Lock()
+	ids := append([]string(nil), s.order...)
+	s.segMu.Unlock()
+	for _, id := range ids {
+		s.segMu.Lock()
+		st := s.segments[id]
+		ok := st != nil && strings.TrimSpace(st.source) != ""
+		s.segMu.Unlock()
+		if !ok {
+			continue
+		}
+		select {
+		case s.trQueue <- id:
+		default:
+			s.log.Warn("translate queue full on lang change", slog.String("seg", id))
+		}
+	}
+}
+
+// resetTranslationState 在翻译方向变更后丢弃旧译文/上下文,防止中英混杂。
+func (s *session) resetTranslationState() {
+	s.segMu.Lock()
+	for _, st := range s.segments {
+		st.target = ""
+		st.targetLang = ""
+		st.translated = false
+		st.revised = false
+	}
+	s.lastReviewKey = ""
+	s.lastTTS = make(map[string]string)
+	s.segMu.Unlock()
+
+	s.partMu.Lock()
+	s.partState = make(map[string]*partialState)
+	s.partMu.Unlock()
 }
 
 // languages 返回当前的源语言提示与目标语言。
@@ -306,6 +380,7 @@ func (s *session) maybeTranslatePartial(segID, source string, start, end int) {
 // translatePartial 异步翻译一段「说话中」的原文并作为 partial 预览下发。
 // 不带上下文(更快、更省),不进纠错/TTS;若该句此时已定稿则丢弃过期预览。
 func (s *session) translatePartial(segID, source string, start, end int) {
+	gen := s.currentLangGen()
 	defer func() {
 		s.partMu.Lock()
 		if ps := s.partState[segID]; ps != nil {
@@ -314,13 +389,15 @@ func (s *session) translatePartial(segID, source string, start, end int) {
 		s.partMu.Unlock()
 	}()
 
-	srcLang, tgtLang := s.languages()
-	target, err := s.tr.Translate(s.ctx, source, nil, tgtLang, srcLang)
+	target, err := s.resolveTargetText(source, nil)
 	if err != nil {
 		s.log.Debug("partial translate failed", slog.String("seg", segID), slog.String("err", err.Error()))
 		return
 	}
 	if strings.TrimSpace(target) == "" {
+		return
+	}
+	if gen != s.currentLangGen() {
 		return
 	}
 
@@ -354,6 +431,20 @@ func (s *session) translateLoop() {
 			s.translateSegment(segID)
 		}
 	}
+}
+
+// resolveTargetText 生成字幕译文:目标语言与原文一致时直通 ASR 文本,
+// 否则调用 LLM 翻译,确保「目标语言是什么,字幕就是什么」。
+func (s *session) resolveTargetText(source string, history []translate.Pair) (string, error) {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return "", nil
+	}
+	srcLang, tgtLang := s.languages()
+	if translate.ShouldPassthrough(source, srcLang, tgtLang) {
+		return source, nil
+	}
+	return s.tr.Translate(s.ctx, source, history, tgtLang, srcLang)
 }
 
 // buildContext 取出 seq 之前、已有译文的最近 N 段作为上下文。
@@ -390,14 +481,18 @@ func (s *session) translateSegment(segID string) {
 		return
 	}
 
-	srcLang, tgtLang := s.languages()
-	target, err := s.tr.Translate(s.ctx, source, s.buildContext(seq), tgtLang, srcLang)
+	gen := s.currentLangGen()
+	_, tgtLang := s.languages()
+	target, err := s.resolveTargetText(source, s.buildContext(seq))
 	if err != nil {
 		s.log.Warn("translate failed", slog.String("seg", segID), slog.String("err", err.Error()))
 		s.writeJSON(map[string]any{"type": "translate_error", "segment_id": segID, "message": err.Error()})
 		return
 	}
 	if target == "" {
+		return
+	}
+	if gen != s.currentLangGen() {
 		return
 	}
 

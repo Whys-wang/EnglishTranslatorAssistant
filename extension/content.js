@@ -16,11 +16,18 @@
 //   - 因为永远在流动,没有「出现 → 等死 → 消失」的硬节奏,消除「字幕停留太久」
 //     和「音画不同步」的别扭感;
 //   - 静音清屏:连续说话时只滚动不消失,但一旦超过 ~3 秒没识别到新内容,字幕条
-//     自动清空留白(滚动效果不变),再次说话时新句子从空白处重新开始滚动。
+//     自动清空留白(滚动效果不变),再次说话时新句子从空白处重新开始滚动;
+//   - 无声音自动停止(可选):桌宠面板可开关,并自定义静音多久后自动停翻;
+//   - 字幕可选中复制;上方四向箭头把手专用于拖动改位置,与选字互不干扰;
+//   - 纠错高亮:被自动纠正过的句子以绿色底色长亮标记,不再淡出消失。
 
 (() => {
-  if (window.__simulInterpreterInjected) return;
-  window.__simulInterpreterInjected = true;
+  // 版本号变化时允许重新注入(否则扩展热更新后页面仍跑旧逻辑)。
+  const CONTENT_SCRIPT_VERSION = 6;
+  if (window.__simulInterpreterVersion === CONTENT_SCRIPT_VERSION) return;
+  window.__simulInterpreterVersion = CONTENT_SCRIPT_VERSION;
+  document.getElementById("__simul_interpreter_pet__")?.remove();
+  document.getElementById("__simul_interpreter_overlay__")?.remove();
 
   const OVERLAY_ID = "__simul_interpreter_overlay__";
   const PET_ID = "__simul_interpreter_pet__";
@@ -31,11 +38,12 @@
   // 静音自动清屏:超过这么久没有识别到新内容,就把当前字幕条清空(留白)。
   // 之后一旦再识别到声音,新句子从空白处重新开始滚动,不影响滚动效果本身。
   const CLEAR_AFTER_SILENCE_MS = 3000;
-  // 纠错高亮:某段被「ASR 修订重译」或「LLM 复审」改过后,在字幕上给它一个
-  // 淡入即淡出的底色高亮,持续这么久后自动消失(让你肉眼看到"这句刚被自动纠正")。
-  const CORRECTED_FLASH_MS = 1200;
-  // 纠正之后,在高亮淡出结束后再额外保留这么久的「安静可读」时间,期间不触发
-  // 静音清屏,确保闪光不会和字幕消失撞在一起、让你来得及看清修正后的句子。
+  // 无声音自动停止:默认关闭;时长与开关由桌宠面板设置并持久化。
+  const DEFAULT_AUTO_STOP_SILENCE_ENABLED = false;
+  const DEFAULT_AUTO_STOP_SILENCE_SEC = 60;
+  const MIN_AUTO_STOP_SILENCE_SEC = 10;
+  const MAX_AUTO_STOP_SILENCE_SEC = 600;
+  // 纠正之后额外保留这么久的「安静可读」时间,期间不触发静音清屏。
   const READ_HOLD_AFTER_CORRECTION_MS = 2200;
 
   // 字幕颜色预设(桌宠面板里以小圆点形式排开,点击即应用)。
@@ -54,6 +62,9 @@
     '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.5-1.8"/></svg>';
   const LOCK_CLOSED_SVG =
     '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>';
+  // 字幕上方拖动手柄:四向箭头(仅拖此图标可移动位置)。
+  const MOVE_HANDLE_SVG =
+    '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5V2M12 19v3M5 12H2M22 12h-3"/><path d="m12 5-3-3 3-3 3 3-3 3z"/><path d="m12 19-3 3 3 3 3-3-3-3z"/><path d="m5 12-3-3 3 3 3 3-3-3z"/><path d="m19 12 3-3-3 3-3 3 3-3z"/></svg>';
 
   // 当前「开始/停止」快捷键(由 background 查询 chrome.commands 回填;用户可改)。
   let currentShortcut = "Alt+Shift+S";
@@ -108,16 +119,22 @@
   let lastActivityAt = 0;
   const clearedIds = new Set();
 
-  // 纠错高亮用:segId -> 高亮起始时间戳;flashTimer 驱动淡出期间的平滑重绘。
-  // lastCorrectionShownAt:最近一次「确实显示出来的纠正」时间,用于在纠正后
-  // 暂缓静音清屏,给用户留出阅读时间。
-  const correctedAt = new Map();
-  let flashTimer = null;
+  // 纠错长亮:曾被自动纠正过的 segment id,绿色底色一直保留到清屏/停翻。
+  // lastCorrectionShownAt:最近一次纠正时间,用于纠正后暂缓静音清屏。
+  const correctedIds = new Set();
   let lastCorrectionShownAt = 0;
 
   // 是否「粘底」:true=自动停在最新两行(默认);用户向上滚动看历史时变 false,
   // 此时不再自动拽回底部、也暂停静音清屏,滚回底部后恢复。
   let stickToBottom = true;
+
+  // 音频 VAD:进入静音时记下时间戳;恢复有声则清零。用于「无声音自动停翻」。
+  let audioSilenceStartedAt = 0;
+  let autoStopSilenceEnabled = DEFAULT_AUTO_STOP_SILENCE_ENABLED;
+  let autoStopSilenceSec = DEFAULT_AUTO_STOP_SILENCE_SEC;
+
+  // 用户正在拖选字幕时暂缓 render,避免 DOM 重建把选区冲掉。
+  let selectionDeferredRender = false;
 
   // 字幕外观偏好:用户拖到哪 / 颜色选的什么,都会持久化到 chrome.storage.local。
   // captionPos 为 null 时表示用默认「底部居中」(由 CSS 控制)。
@@ -125,32 +142,49 @@
   let captionColor = DEFAULT_CAPTION_COLOR;
   let captionLocked = false; // 锁定后字幕不可拖动(右上角锁图标切换,持久化)
 
-  function ensureOverlay() {
-    let el = document.getElementById(OVERLAY_ID);
-    if (el) return el;
-    el = document.createElement("div");
-    el.id = OVERLAY_ID;
-    // 字幕条 + 右上角锁图标。初始 span 占位,render 会按分段重建内容。
-    el.innerHTML = `<div class="si-caption"><span class="si-committed"></span><span class="si-tentative"></span></div><button class="si-caption-lock" type="button"></button>`;
-    document.documentElement.appendChild(el);
-    applyCaptionPos(el);
-    applyCaptionColor(el);
-    applyCaptionLock(el);
-    makeCaptionDraggable(el);
+  function buildOverlayHTML() {
+    return `<div class="si-caption-stack"><button class="si-caption-move" type="button" aria-label="拖动字幕" title="拖此处移动字幕">${MOVE_HANDLE_SVG}</button><div class="si-caption"><span class="si-committed"></span><span class="si-tentative"></span></div></div><button class="si-caption-lock" type="button"></button>`;
+  }
 
-    // 滚动监听:判断用户是否在底部附近。滚到底=粘底(自动跟最新);
-    // 向上滚=查看历史,暂停自动跟随与静音清屏。
+  // 把旧版字幕 DOM 迁移为「上方箭头把手 + 字幕条」结构。
+  function migrateOverlayDOM(el) {
+    if (!el) return;
+    if (!el.querySelector(".si-caption-stack") || el.querySelector(".si-caption-shell")) {
+      el.innerHTML = buildOverlayHTML();
+    } else if (!el.querySelector(".si-caption-move")) {
+      const stack = el.querySelector(".si-caption-stack");
+      const cap = el.querySelector(".si-caption");
+      if (stack && cap) {
+        const btn = document.createElement("button");
+        btn.className = "si-caption-move";
+        btn.type = "button";
+        btn.title = "拖此处移动字幕";
+        btn.setAttribute("aria-label", "拖动字幕");
+        btn.innerHTML = MOVE_HANDLE_SVG;
+        stack.insertBefore(btn, cap);
+      }
+    }
+    delete el.dataset.siDragBound;
+    delete el.dataset.siScrollBound;
+    delete el.dataset.siLockBound;
+  }
+
+  function bindOverlayInteractions(el) {
+    if (!el || el.dataset.siDragBound === "1") return;
+    makeCaptionDraggable(el);
+    el.dataset.siDragBound = "1";
+
     const captionEl = el.querySelector(".si-caption");
-    if (captionEl) {
+    if (captionEl && el.dataset.siScrollBound !== "1") {
       captionEl.addEventListener("scroll", () => {
         stickToBottom =
           captionEl.scrollHeight - captionEl.scrollTop - captionEl.clientHeight < 24;
       });
+      el.dataset.siScrollBound = "1";
     }
 
-    // 锁图标:点击切换锁定/解锁并持久化;阻止冒泡,避免被拖动逻辑吞掉。
     const lockBtn = el.querySelector(".si-caption-lock");
-    if (lockBtn) {
+    if (lockBtn && el.dataset.siLockBound !== "1") {
       lockBtn.addEventListener("pointerdown", (e) => e.stopPropagation());
       lockBtn.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -158,25 +192,51 @@
         try { chrome.storage?.local?.set({ captionLocked }); } catch {}
         applyCaptionLock(el);
       });
+      el.dataset.siLockBound = "1";
     }
+  }
+
+  function ensureOverlay() {
+    let el = document.getElementById(OVERLAY_ID);
+    if (el) {
+      if (!el.querySelector(".si-caption-stack") || el.querySelector(".si-caption-shell")) {
+        migrateOverlayDOM(el);
+      }
+      bindOverlayInteractions(el);
+      return el;
+    }
+    el = document.createElement("div");
+    el.id = OVERLAY_ID;
+    el.innerHTML = buildOverlayHTML();
+    document.documentElement.appendChild(el);
+    applyCaptionPos(el);
+    applyCaptionColor(el);
+    applyCaptionLock(el);
+    bindOverlayInteractions(el);
     return el;
   }
 
-  function removeOverlay() {
-    const el = document.getElementById(OVERLAY_ID);
-    if (el) el.remove();
+  function clearCaptionState() {
     finals.clear();
     tentative.segId = null;
     tentative.target = "";
     lastActivityAt = 0;
     clearedIds.clear();
-    correctedAt.clear();
+    correctedIds.clear();
     lastCorrectionShownAt = 0;
     stickToBottom = true;
-    if (flashTimer) {
-      clearTimeout(flashTimer);
-      flashTimer = null;
-    }
+  }
+
+  // 切换源/目标语言时清空当前字幕缓存,避免旧语言译文残留或闪一下别的语言。
+  function resetCaptionsForLangChange() {
+    clearCaptionState();
+    render(true);
+  }
+
+  function removeOverlay() {
+    const el = document.getElementById(OVERLAY_ID);
+    if (el) el.remove();
+    clearCaptionState();
   }
 
   // 应用「字幕条位置」到 overlay 元素:
@@ -208,17 +268,19 @@
     overlay.style.setProperty("--si-caption-color", captionColor || DEFAULT_CAPTION_COLOR);
   }
 
-  // 应用锁定状态:切换锁图标(开/合)、字幕光标,并据此启用/禁用拖动。
+  // 应用锁定状态:锁定时隐藏上方拖动手柄,仅保留文字选区。
   function applyCaptionLock(overlay) {
     if (!overlay) return;
     const btn = overlay.querySelector(".si-caption-lock");
-    const caption = overlay.querySelector(".si-caption");
+    const stack = overlay.querySelector(".si-caption-stack");
     if (btn) {
       btn.innerHTML = captionLocked ? LOCK_CLOSED_SVG : LOCK_OPEN_SVG;
       btn.classList.toggle("si-locked-on", captionLocked);
-      btn.title = captionLocked ? "字幕已锁定 · 点击解锁后可拖动" : "字幕可拖动 · 点击锁定位置";
+      btn.title = captionLocked
+        ? "字幕已锁定 · 文字可选中复制 · 点击解锁后可拖动位置"
+        : "拖上方箭头移动 · 文字区可选中复制 · 点击锁定";
     }
-    if (caption) caption.classList.toggle("si-locked", captionLocked);
+    if (stack) stack.classList.toggle("si-locked", captionLocked);
   }
 
   // 重置字幕位置到默认(底部居中),并清除 storage 中保存的位置。
@@ -273,41 +335,45 @@
     });
   }
 
-  // 把 overlay 做成「按住 + 拖动」就能改位置,松手即保存到 storage。
-  // 边界做了夹取,不会被拖到屏幕外面去找不回来;实在拖丢可点桌宠面板的「重置位置」。
+  // 用户是否正在字幕区域内拖选文字(有非折叠选区)。
+  function hasCaptionSelection() {
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return false;
+    const caption = document.getElementById(OVERLAY_ID)?.querySelector(".si-caption");
+    if (!caption) return false;
+    const node = sel.anchorNode;
+    return !!(node && caption.contains(node));
+  }
+
+  // 仅拖字幕上方的四向箭头把手可改位置;字幕文字区留给选中复制。
   function makeCaptionDraggable(overlay) {
-    const caption = overlay.querySelector(".si-caption");
-    if (!caption) return;
+    const handle = overlay.querySelector(".si-caption-move");
+    const stack = overlay.querySelector(".si-caption-stack");
+    if (!handle) return;
     let dragging = false;
     let startX = 0;
     let startY = 0;
     let originLeft = 0;
     let originTop = 0;
-    let moved = false;
 
-    caption.addEventListener("pointerdown", (e) => {
-      if (captionLocked) return; // 已锁定:禁止拖动
-      // 点在右侧滚动条上时不拖动,交给原生滚动(clientWidth 不含滚动条宽度)。
-      if (e.offsetX > caption.clientWidth) return;
+    handle.addEventListener("pointerdown", (e) => {
+      if (captionLocked || e.button !== 0) return;
       dragging = true;
-      moved = false;
       startX = e.clientX;
       startY = e.clientY;
       const rect = overlay.getBoundingClientRect();
       originLeft = rect.left;
       originTop = rect.top;
-      caption.classList.add("si-dragging");
-      try { caption.setPointerCapture(e.pointerId); } catch {}
+      stack?.classList.add("si-dragging");
+      try { handle.setPointerCapture(e.pointerId); } catch {}
       e.preventDefault();
       e.stopPropagation();
     });
 
-    caption.addEventListener("pointermove", (e) => {
+    handle.addEventListener("pointermove", (e) => {
       if (!dragging) return;
       const dx = e.clientX - startX;
       const dy = e.clientY - startY;
-      if (Math.abs(dx) + Math.abs(dy) > 2) moved = true;
-      if (!moved) return;
       const maxL = Math.max(0, window.innerWidth - overlay.offsetWidth);
       const maxT = Math.max(0, window.innerHeight - overlay.offsetHeight);
       captionPos = {
@@ -320,16 +386,15 @@
     const end = (e) => {
       if (!dragging) return;
       dragging = false;
-      caption.classList.remove("si-dragging");
-      try { caption.releasePointerCapture(e.pointerId); } catch {}
-      // 没真正拖动(只是点了一下)就什么都不保存。
-      if (!moved || !captionPos) return;
+      stack?.classList.remove("si-dragging");
+      try { handle.releasePointerCapture(e.pointerId); } catch {}
+      if (!captionPos) return;
       try {
         chrome.storage?.local?.set({ captionPos });
       } catch {}
     };
-    caption.addEventListener("pointerup", end);
-    caption.addEventListener("pointercancel", end);
+    handle.addEventListener("pointerup", end);
+    handle.addEventListener("pointercancel", end);
   }
 
   // 把后端推来的一条 subtitle 事件吸收到 finals / tentative 里。
@@ -385,26 +450,20 @@
     return pieces;
   }
 
-  // 某段是否处于「刚被纠正」的高亮窗口内,返回 1->0 的剩余强度(线性淡出)。
-  function correctionStrength(id, now) {
-    if (id == null) return 0;
-    const ts = correctedAt.get(id);
-    if (ts == null) return 0;
-    const elapsed = now - ts;
-    if (elapsed >= CORRECTED_FLASH_MS) return 0;
-    return 1 - elapsed / CORRECTED_FLASH_MS;
-  }
-
   // 渲染字幕:左对齐 + 底部锚定的竖直滚动(参考 YouTube / 系统实时字幕)。
   // 关键改动:不再「按末尾 N 字滑动 + 居中」——那会让整行每来一个字就重新居中、
   // 向左横移,导致正在读的内容一直在跑、读不完就被挤走。现在文字左对齐、自然换行、
   // 只在末尾追加(已显示的文字不再左右横移),旧内容向上滚出视野,
   // 底部始终停在最新两行,阅读位置稳定。
-  function render() {
+  function render(force) {
+    if (!force && hasCaptionSelection()) {
+      selectionDeferredRender = true;
+      return;
+    }
+    selectionDeferredRender = false;
     const overlay = ensureOverlay();
     const caption = overlay.querySelector(".si-caption");
     if (!caption) return;
-    const now = Date.now();
     // 记录重建前的滚动位置:用户在看历史(未粘底)时,重建后要还原,不能跳。
     const prevScrollTop = caption.scrollTop;
 
@@ -412,21 +471,13 @@
 
     // 按分段重建 span。.si-caption 本身不重建,挂在它上面的拖动监听不受影响。
     caption.textContent = "";
-    let anyFlash = false;
     pieces.forEach((it, idx) => {
       if (idx > 0) caption.appendChild(document.createTextNode(" "));
       const span = document.createElement("span");
       span.className = it.tentative ? "si-tentative" : "si-committed";
       span.textContent = it.text;
-      if (!it.tentative) {
-        const k = correctionStrength(it.id, now);
-        if (k > 0) {
-          span.classList.add("si-corrected");
-          // 高亮底色随剩余强度淡出;直接写内联色,不靠 CSS 动画
-          // (span 每次 render 都会重建,CSS 动画会被反复打断,无法形成平滑淡出)。
-          span.style.backgroundColor = "rgba(86, 214, 132, " + (0.55 * k).toFixed(3) + ")";
-          anyFlash = true;
-        }
+      if (!it.tentative && correctedIds.has(it.id)) {
+        span.classList.add("si-corrected");
       }
       caption.appendChild(span);
     });
@@ -441,33 +492,13 @@
       caption.scrollTop = prevScrollTop;
     }
 
-    // 清理过期高亮记录,避免 Map 无限增长。
-    if (correctedAt.size) {
-      for (const [id, ts] of correctedAt) {
-        if (now - ts >= CORRECTED_FLASH_MS) correctedAt.delete(id);
-      }
-    }
-    // 仍有高亮在淡出 -> 安排下一帧重绘,做出平滑淡出(即使此刻没有新字幕进来)。
-    if (anyFlash) scheduleFlash();
   }
 
-  // 高亮淡出的「补帧」循环:在淡出窗口内以 ~12fps 反复重绘,直到所有高亮消失。
-  // 单一 timer 防止并发循环;render 在仍有高亮时会自动续上。
-  function scheduleFlash() {
-    if (flashTimer) return;
-    flashTimer = setTimeout(() => {
-      flashTimer = null;
-      render();
-    }, 80);
-  }
-
-  // 标记某段「刚被自动纠正」,触发淡出高亮。只对当前确实在显示的句子打标,
-  // 已被静音清屏的句子不再高亮(它根本不在屏上)。
+  // 标记某段曾被自动纠正,绿色长亮直到清屏/停翻。
   function markCorrected(segId) {
     if (!segId || !finals.has(segId)) return;
-    const now = Date.now();
-    correctedAt.set(segId, now);
-    lastCorrectionShownAt = now;
+    correctedIds.add(segId);
+    lastCorrectionShownAt = Date.now();
   }
 
   // 静音清屏:翻译进行中,若超过 CLEAR_AFTER_SILENCE_MS 没有新内容进来,
@@ -481,15 +512,13 @@
     if (!stickToBottom) return;
     const now = Date.now();
     if (!lastActivityAt || now - lastActivityAt < CLEAR_AFTER_SILENCE_MS) return;
-    // 刚有过纠正:在高亮淡出 + 一段可读时间内不清屏,避免「闪一下就消失」。
-    if (
-      lastCorrectionShownAt &&
-      now - lastCorrectionShownAt < CORRECTED_FLASH_MS + READ_HOLD_AFTER_CORRECTION_MS
-    ) {
+    // 刚有过纠正:在一段时间内不清屏,避免纠正标记刚出现就被清掉。
+    if (lastCorrectionShownAt && now - lastCorrectionShownAt < READ_HOLD_AFTER_CORRECTION_MS) {
       return;
     }
     clearedIds.clear();
     for (const id of finals.keys()) clearedIds.add(id);
+    correctedIds.clear();
     if (tentative.segId) clearedIds.add(tentative.segId);
     finals.clear();
     tentative.segId = null;
@@ -497,6 +526,78 @@
     render();
   }
   setInterval(clearCaptionOnSilence, 500);
+
+  // 仅当页面音频「进入静音」时才开始计时;一旦恢复有声立刻清零。
+  // 计时起点绝不是「开始翻译」的时刻,而是「真的没声音了」之后。
+  function onAudioVAD(event) {
+    if (event === "silence") {
+      audioSilenceStartedAt = Date.now();
+    } else if (event === "speech") {
+      audioSilenceStartedAt = 0;
+    }
+  }
+
+  function clampAutoStopSec(sec) {
+    const n = Math.round(Number(sec));
+    if (!Number.isFinite(n)) return DEFAULT_AUTO_STOP_SILENCE_SEC;
+    return Math.max(MIN_AUTO_STOP_SILENCE_SEC, Math.min(MAX_AUTO_STOP_SILENCE_SEC, n));
+  }
+
+  function syncPetSilenceStopUI() {
+    const pet = document.getElementById(PET_ID);
+    if (!pet) return;
+    const chk = pet.querySelector(".si-pet-auto-stop-enable");
+    const inp = pet.querySelector(".si-pet-silence-sec");
+    const row = pet.querySelector(".si-pet-silence-row");
+    if (chk) chk.checked = autoStopSilenceEnabled;
+    if (inp) {
+      inp.value = String(autoStopSilenceSec);
+      inp.disabled = !autoStopSilenceEnabled;
+    }
+    if (row) row.classList.toggle("si-disabled", !autoStopSilenceEnabled);
+  }
+
+  function saveSilenceStopPrefs() {
+    try {
+      chrome.storage?.local?.set({ autoStopSilenceEnabled, autoStopSilenceSec });
+    } catch {}
+  }
+
+  function restoreSilenceStopPrefs() {
+    try {
+      chrome.storage?.local?.get(["autoStopSilenceEnabled", "autoStopSilenceSec"], (r) => {
+        if (typeof r?.autoStopSilenceEnabled === "boolean") {
+          autoStopSilenceEnabled = r.autoStopSilenceEnabled;
+        }
+        if (typeof r?.autoStopSilenceSec === "number") {
+          autoStopSilenceSec = clampAutoStopSec(r.autoStopSilenceSec);
+        }
+        syncPetSilenceStopUI();
+      });
+    } catch {}
+  }
+
+  // 静音已持续达到用户设定秒数 -> 自动停翻(需桌宠面板开启)。
+  function autoStopOnAudioSilence() {
+    if (!autoStopSilenceEnabled) return;
+    if (!running || !audioSilenceStartedAt) return;
+    const silentForMs = Date.now() - audioSilenceStartedAt;
+    if (silentForMs < autoStopSilenceSec * 1000) return;
+    audioSilenceStartedAt = 0;
+    try {
+      chrome.runtime.sendMessage({ target: "background", type: "stop" });
+    } catch {}
+    setRunning(false);
+    const pet = document.getElementById(PET_ID);
+    const statusEl = pet?.querySelector(".si-pet-status");
+    if (statusEl) statusEl.textContent = `已自动停止(静音持续 ${autoStopSilenceSec} 秒)`;
+  }
+  setInterval(autoStopOnAudioSilence, 1000);
+
+  // 选区消失后补一次被推迟的 render。
+  document.addEventListener("selectionchange", () => {
+    if (selectionDeferredRender && !hasCaptionSelection()) render();
+  });
 
   // ── 桌宠控制台(可拖动) ─────────────────────────────────────────────
   let petTalkTimer = null;
@@ -599,7 +700,17 @@
         </label>
         <button class="si-pet-start" type="button">开始翻译</button>
         <button class="si-pet-stop" type="button">停止翻译</button>
-        <div class="si-pet-section">字幕外观(可直接拖动字幕条改位置)</div>
+        <div class="si-pet-section">无声音自动停止</div>
+        <label class="si-pet-check">
+          <input type="checkbox" class="si-pet-auto-stop-enable" />
+          <span>开启(仅统计页面无声音时长)</span>
+        </label>
+        <label class="si-pet-field si-pet-silence-row">
+          <span>静音持续</span>
+          <input type="number" class="si-pet-silence-sec" min="10" max="600" step="5" value="60" />
+          <span>秒后停翻</span>
+        </label>
+        <div class="si-pet-section">字幕外观(拖上方箭头移动,文字可选中复制)</div>
         <div class="si-pet-color-row">
           ${colorPresetButtons}
           <input type="color" class="si-pet-color-picker" value="${captionColor}" title="自定义颜色">
@@ -634,10 +745,12 @@
     }
     srcSel.addEventListener("change", () => {
       try { chrome.storage?.local?.set({ sourceLang: srcSel.value }); } catch {}
+      if (running) resetCaptionsForLangChange();
       pushLangConfig();
     });
     tgtSel.addEventListener("change", () => {
       try { chrome.storage?.local?.set({ targetLang: tgtSel.value }); } catch {}
+      if (running) resetCaptionsForLangChange();
       pushLangConfig();
     });
     // 防止下拉/按钮交互被拖动逻辑吞掉。
@@ -681,6 +794,21 @@
       } catch {}
     });
 
+    const autoStopChk = pet.querySelector(".si-pet-auto-stop-enable");
+    const silenceSecInp = pet.querySelector(".si-pet-silence-sec");
+    autoStopChk.addEventListener("change", () => {
+      autoStopSilenceEnabled = !!autoStopChk.checked;
+      syncPetSilenceStopUI();
+      saveSilenceStopPrefs();
+    });
+    function applySilenceSecFromInput() {
+      autoStopSilenceSec = clampAutoStopSec(silenceSecInp.value);
+      silenceSecInp.value = String(autoStopSilenceSec);
+      saveSilenceStopPrefs();
+    }
+    silenceSecInp.addEventListener("change", applySilenceSecFromInput);
+    silenceSecInp.addEventListener("blur", applySilenceSecFromInput);
+
     // 字幕颜色:预设按钮 + 自定义 color picker,改完即刻应用并持久化。
     function applyAndSaveColor(c) {
       if (!/^#[0-9a-fA-F]{6}$/.test(c)) return;
@@ -703,8 +831,10 @@
       resetCaptionPos();
     });
 
-    // 面板刚拼好,把当前 captionColor 同步到 UI(高亮命中预设 / 写入 picker 值)。
+    // 面板刚拼好,把当前 captionColor / 无声音停翻设置同步到 UI。
     syncPetColorUI();
+    syncPetSilenceStopUI();
+    restoreSilenceStopPrefs();
 
     restorePetPos(pet);
     makePetDraggable(pet);
@@ -718,6 +848,7 @@
 
   function setRunning(on) {
     running = !!on;
+    if (!running) audioSilenceStartedAt = 0;
     const pet = document.getElementById(PET_ID);
     if (!pet) return;
     pet.classList.toggle("si-pet-running", running);
@@ -745,7 +876,7 @@
   // 控制面板尺寸的保守估计(实际约 212x247,稍微宽一点更稳)。
   // 用来决定面板朝桌宠的哪个方向展开,确保不溢出屏幕。
   const PANEL_W = 220;
-  const PANEL_H = 260;
+  const PANEL_H = 320;
 
   // updateQuadrant 给桌宠打 si-pet-q-tl / tr / bl / br 类,
   // CSS 据此决定控制面板向远离屏幕边缘的方向展开。
@@ -881,7 +1012,7 @@
       setRunning(true);
       ingestSubtitle(msg);
       // 后端标记 corrected=true:本句由「ASR 修订重译」或「LLM 复审」纠正过,
-      // 给它一个淡出高亮,让用户看到自动纠错确实发生了。
+      // 打上绿色长亮标记,方便辨认哪些句子被自动改过。
       if (msg.corrected) markCorrected(msg.segment_id);
       render();
       // 有新译文就让桌宠张嘴做一下「正在说话」动画(不再弹气泡,避免遮挡页面)。
@@ -891,13 +1022,14 @@
       // 句子文本仍是空(已有原文则保留),不影响后续译文/纠错回填覆盖。
       // 这里不放醒目报错,避免在流式字幕中插入一个无法滚掉的"⚠"字样。
     } else if (msg.type === "vad") {
-      // VAD 仅做 worklet 端的静音检测信号,这里不直接用它清屏。
-      // 「静音超过 3 秒清屏」由 clearCaptionOnSilence 定时器按「最近识别到内容的时间」
-      // 判定(见 CLEAR_AFTER_SILENCE_MS),比逐帧 VAD 更稳,也不会被环境噪声误触发。
+      // VAD:检测页面何时进入/离开静音,驱动「静音持续 N 秒后停翻」。
+      onAudioVAD(msg.event);
     } else if (msg.type === "state") {
       setRunning(!!msg.running);
     } else if (msg.type === "clear") {
       setRunning(false);
+    } else if (msg.type === "lang_change") {
+      resetCaptionsForLangChange();
     }
   });
 
