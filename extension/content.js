@@ -23,7 +23,7 @@
 
 (() => {
   // 版本号变化时允许重新注入(否则扩展热更新后页面仍跑旧逻辑)。
-  const CONTENT_SCRIPT_VERSION = 11;
+  const CONTENT_SCRIPT_VERSION = 13;
   if (window.__simulInterpreterVersion === CONTENT_SCRIPT_VERSION) return;
   window.__simulInterpreterVersion = CONTENT_SCRIPT_VERSION;
   document.getElementById("__simul_interpreter_pet__")?.remove();
@@ -760,8 +760,9 @@
         </label>
         <label class="si-pet-field si-pet-silence-row">
           <span>静音持续</span>
-          <input type="number" class="si-pet-silence-sec" min="10" max="600" step="5" value="60" />
+          <input type="number" class="si-pet-silence-sec" min="10" max="600" step="5" value="60" title="≥10秒" />
           <span>秒后停翻</span>
+          <span class="si-pet-silence-hint" title="最小10秒">≥10秒</span>
         </label>
         <div class="si-pet-section">字幕外观(拖上方箭头移动,文字可选中复制)</div>
         <div class="si-pet-color-row">
