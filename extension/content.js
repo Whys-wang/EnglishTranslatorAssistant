@@ -74,13 +74,11 @@
   }
 
   // 把启动失败的原始错误(多为英文)翻译成友好的中文引导。
-  // 最常见的是 Chrome 的安全限制:抓取标签页音频必须由「点扩展图标 / 按快捷键」
-  // 这种对扩展本身的操作来触发,页面内按钮首次点击会报 activeTab 未授权。
   function friendlyStartError(raw) {
     const s = String(raw || "");
     if (/has not been invoked|activeTab|user gesture|invoked for the current/i.test(s)) {
-      const key = currentShortcut ? `(或按 ${currentShortcut})` : "";
-      return `首次在本页使用,请先点一下浏览器右上角的扩展图标${key}授权本页;点图标会直接开始翻译,之后这个按钮也能用了。`;
+      const key = currentShortcut ? `或按 ${currentShortcut}` : "";
+      return `本页尚未授权抓音,请再点一次「开始翻译」${key ? `,${key}` : ""};仍失败时点浏览器右上角扩展图标授权。`;
     }
     if (/cannot be captured|chrome:\/\/|chrome pages|extension gallery|chromewebstore/i.test(s)) {
       return "此页面无法捕获音频(Chrome 内部页 / 商店页 / 新标签页等)。请在普通网页(如视频、播客页)上使用。";

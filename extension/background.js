@@ -59,8 +59,27 @@ async function ensureContentScript(tabId) {
 
 let rxCount = 0;
 
-async function startCapture(tabId, sourceLang, targetLang) {
-  console.log("[SI] startCapture, tabId =", tabId, "lang =", sourceLang, "->", targetLang);
+// 在用户手势链内同步发起 tabCapture(回调式),避免先 await 其它任务导致授权失效。
+function getStreamIdForTab(tabId) {
+  return new Promise((resolve, reject) => {
+    chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (streamId) => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        reject(new Error(err.message));
+        return;
+      }
+      if (!streamId) {
+        reject(new Error("getMediaStreamId 未返回 streamId"));
+        return;
+      }
+      resolve(streamId);
+    });
+  });
+}
+
+// streamId 已取得后的后续步骤(可安全 await)。
+async function startCaptureWithStreamId(tabId, sourceLang, targetLang, streamId) {
+  console.log("[SI] startCaptureWithStreamId, tabId =", tabId, "streamId =", streamId);
   await setActiveTab(tabId);
   rxCount = 0;
   try {
@@ -76,12 +95,6 @@ async function startCapture(tabId, sourceLang, targetLang) {
   await ensureOffscreen();
   console.log("[SI] offscreen 文档已就绪");
 
-  const streamId = await chrome.tabCapture.getMediaStreamId({
-    targetTabId: tabId,
-  });
-  console.log("[SI] 取得 streamId =", streamId);
-
-  // 交给 offscreen 去真正采集音频(带上翻译方向)。
   chrome.runtime.sendMessage({
     target: "offscreen",
     type: "start",
@@ -92,7 +105,6 @@ async function startCapture(tabId, sourceLang, targetLang) {
   });
   console.log("[SI] 已通知 offscreen 开始采集");
 
-  // 通知页面桌宠:已进入「翻译中」状态。
   try {
     await chrome.tabs.sendMessage(tabId, { channel: "page-subtitle", type: "state", running: true });
   } catch (e) {
@@ -100,8 +112,14 @@ async function startCapture(tabId, sourceLang, targetLang) {
   }
 }
 
+// 扩展图标 / 快捷键触发:扩展已被唤起,可整体 async。
+async function startCapture(tabId, sourceLang, targetLang) {
+  console.log("[SI] startCapture, tabId =", tabId, "lang =", sourceLang, "->", targetLang);
+  const streamId = await getStreamIdForTab(tabId);
+  await startCaptureWithStreamId(tabId, sourceLang, targetLang, streamId);
+}
+
 // toggleTranslation 由快捷键 / 图标触发:未在翻译则开始(抓当前标签页),否则停止。
-// 注意:tabCapture 必须由「扩展被调用」(快捷键/图标)触发,不能由网页内的桌宠直接发起。
 async function toggleTranslation(tab) {
   const active = await getActiveTab();
   if (active != null) {
@@ -134,7 +152,6 @@ chrome.action.onClicked.addListener((tab) => toggleTranslation(tab));
 
 // 让桌宠对「当前已经打开的所有标签页」也立即出现:
 // content_scripts 只对之后新加载的页面注入,已打开的旧标签页需要主动补注入。
-// 扩展安装/更新/浏览器启动时各跑一次,用户就不必逐页点击或刷新。
 async function injectPetIntoOpenTabs() {
   let tabs = [];
   try {
@@ -148,12 +165,22 @@ async function injectPetIntoOpenTabs() {
     chrome.scripting.executeScript({ target: { tabId: t.id }, files: ["content.js"] }).catch(() => {});
   }
 }
-chrome.runtime.onInstalled.addListener(injectPetIntoOpenTabs);
-chrome.runtime.onStartup.addListener(injectPetIntoOpenTabs);
-// Service Worker 一启动(含手动「重新加载」扩展)就补注入一次:
-// 比只依赖 onInstalled 更可靠,确保已打开的旧标签页也立刻出现桌宠。
-console.log("[SI] background v0.2.0 启动,向已打开标签页注入桌宠");
-injectPetIntoOpenTabs();
+
+// 扩展启动时预热:桌宠注入 + offscreen 文档就绪。
+// 这样桌宠「开始翻译」点击时不必先 await 注入/建文档,手势链内即可拿到 streamId。
+async function bootExtension() {
+  await injectPetIntoOpenTabs();
+  try {
+    await ensureOffscreen();
+    console.log("[SI] boot: offscreen 已预热");
+  } catch (e) {
+    console.warn("[SI] boot: offscreen 预热失败", e);
+  }
+}
+chrome.runtime.onInstalled.addListener(bootExtension);
+chrome.runtime.onStartup.addListener(bootExtension);
+console.log("[SI] background v0.2.2 启动,boot 预热中");
+bootExtension();
 
 // 打开浏览器的扩展快捷键设置页(Edge / Chrome 路径不同)。
 function openShortcutsPage() {
@@ -242,8 +269,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ ok: false, error: "找不到当前标签页" });
         return true;
       }
-      startCapture(tabId, msg.sourceLang, msg.targetLang).then(
-        () => sendResponse({ ok: true }),
+      // 桌宠点击属于用户手势:必须在 onMessage 回调里同步发起 getMediaStreamId,
+      // 不能先 await ensureContentScript 等,否则 Chrome 会拒绝 tabCapture。
+      getStreamIdForTab(tabId).then(
+        (streamId) =>
+          startCaptureWithStreamId(tabId, msg.sourceLang, msg.targetLang, streamId).then(
+            () => sendResponse({ ok: true }),
+            (err) => sendResponse({ ok: false, error: String(err) })
+          ),
         (err) => sendResponse({ ok: false, error: String(err) })
       );
       return true; // async
