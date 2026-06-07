@@ -35,14 +35,17 @@
 │   └── internal/
 │       ├── config/           # ★ 所有密钥与可调参数写死在此(不读环境变量)
 │       ├── logging/          # 结构化日志(记录 X-Tt-Logid)
-│       └── server/           # WebSocket 中继骨架
-└── extension/                # Chrome 扩展 (Manifest V3)
+│       ├── asr/              # 火山 ASR 流式客户端(二进制协议)
+│       ├── translate/        # 方舟翻译、分句策略、术语表、语种路由
+│       ├── tts/              # 火山 TTS 双向流式 V3(连接复用)
+│       └── server/           # WebSocket 中继、会话、纠错调度
+└── extension/                # Chrome/Edge 扩展 (Manifest V3)
     ├── manifest.json
-    ├── background.js         # Service Worker:控制 & 转发
-    ├── offscreen.html/.js    # 音频采集 + WebSocket 推流
-    ├── audio-worklet.js      # 16kHz PCM 重采样(里程碑 2)
+    ├── background.js         # Service Worker:抓音授权、状态、消息转发
+    ├── offscreen.html/.js    # 音频采集 + WebSocket 推流 + TTS 播放
+    ├── audio-worklet.js      # 16kHz PCM 重采样 + VAD(里程碑 2)
     ├── content.js + overlay.css  # 桌宠控制台 + 滚动字幕 overlay
-    └── popup.html/.js        # (兼容)弹窗控制
+    └── popup.html/.js        # 遗留弹窗页(未挂 default_popup;主入口为扩展图标/快捷键 + 桌宠)
 ```
 
 ## 配置(写死,不用环境变量)
@@ -116,11 +119,12 @@ curl http://localhost:8765/healthz
 > | **韩语** | 整句单条,60ms 预览跟嘴 | 定稿秒升预览 + 后台 Pro 精修 |
 > | **法语/德语** | 整句单条,100ms 预览跟嘴 | 定稿秒升预览 + 后台 Pro 精修 |
 > | **俄语** | 整句单条,90ms 预览跟嘴 | 定稿秒升预览 + 后台 Pro 精修 |
+> | **西班牙语** | 整句单条,预览节流 250ms(沿用欧美默认) | 定稿走 Pro 完整翻译 |
 > 小语种走专用 ASR 路由与更快判停。桌宠支持**语言热切换**(翻译进行中改源/目标语立即生效)。
 
 ## 成品预览(运行成功截图)
 
-以下为**实际运行**界面(俄→中示例):桌宠控制台 + Chrome 扩展 + 页面底部**滚动累积中文字幕**。
+以下为**实际运行**界面(俄→中示例):桌宠控制台(含 `≥10秒` 静音下限提示) + 扩展已加载 + 页面底部**滚动累积中文字幕**。快捷键以浏览器扩展快捷键页为准(默认 `Alt+Shift+S`)。
 
 | 滚动字幕(视频页) | 扩展已加载 | 桌宠控制面板 |
 |---|---|---|
@@ -142,7 +146,7 @@ curl http://localhost:8765/healthz
    ```
    看到日志 `websocket relay listening addr=0.0.0.0:8765 ws_path=/ws` 即就绪;
    可另开一个终端 `curl http://localhost:8765/healthz` 看到 `{"status":"ok"}` 确认存活。
-3. Chrome 加载扩展(`chrome://extensions` → 开发者模式 → 加载已解压的扩展程序 → 选 `extension/`)。
+3. Chrome 或 Edge 加载扩展(`chrome://extensions` / `edge://extensions` → 开发者模式 → 加载已解压的扩展程序 → 选 `extension/`)。主入口为**扩展图标/快捷键 + 桌宠**;`popup.html` 为遗留文件,未在 `manifest.json` 挂 `default_popup`。
 4. 打开一个**有外语音频**的标签页(英文演讲 / 播客 / 视频),先**手动播放**确认有声音;页面右下角会出现**桌宠**。
 
 ### 1. 开场(15 秒)
@@ -179,7 +183,7 @@ curl http://localhost:8765/healthz
 
 - **桌宠点「开始翻译」没反应?** 每个新标签页**第一次**需先点工具栏扩展图标或按快捷键授权本页;之后桌宠按钮即可用。
 - **字幕不出现?** 先确认后端在跑(`/healthz` 为 ok)、桌宠面板显示已开始(或后端有 `client connected` 日志)、且标签页**确实在出声**;再看 `asr handshake` 与 `audio received`。
-- **只有原文、没有中文译文?** 多半是 `ArkAPIKey/ArkModel` 仍是占位符,后端会打印 `translation disabled` 警告。填好真实方舟配置即可。
+- **只有空白、没有中文译文?** 界面只显示目标语(中文);多半是 `ArkAPIKey/ArkModel` 仍是占位符,后端会打印 `translation disabled` 警告。填好真实方舟配置即可。
 - **听不到语音?** TTS 默认关闭;需在 `config.go` 设 `TTS.Enable=true` 并把 `TTSVoiceType` 填成控制台音色列表里的真实值(占位符时后端只打印一次性提示、不影响字幕)。
 - **采样率/音频不对?** 后端 `audio received` 日志会按 16kHz 估算时长,可据此核对前端重采样是否正常。
 - **连接老断?** 属正常,前后端都会指数退避自动重连(参数见 `config.Reconnect`)。
