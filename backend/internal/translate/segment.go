@@ -13,6 +13,8 @@ type StreamSegmentPolicy struct {
 	PartialCancelGrow      int           // 原文变化几个字就取消慢预览;0=用默认阈值
 	PromotePartialOnFinal  bool          // 定稿时是否秒升预览(仅 CJK 等需要;英语关闭)
 	SkipBackgroundRefine   bool          // 秒升定稿后不再后台 Pro 精修(仅日语等需提速时)
+	SkipPartialPreview     bool          // true=定稿前不推预览,避免碎词闪烁
+	MergeShortUtterances   bool          // true=把 ASR 连续短定稿并入上一条(俄语等)
 	AllowWeakSplit         bool
 	AllowSpaceSplit    bool
 	DisableClauseFlush bool // true=整句一条字幕,预览/定稿共用 segment_id
@@ -28,8 +30,8 @@ func SegmentPolicyFor(source, srcLang string) StreamSegmentPolicy {
 		return StreamSegmentPolicy{
 			MinRunes: 10, MaxRunes: 0,
 			PartialMinTail: 1, PartialMinChars: 1,
-			PartialMinInterval: 35 * time.Millisecond,
-			PartialPromoteWait: 400 * time.Millisecond,
+			PartialMinInterval: 22 * time.Millisecond,
+			PartialPromoteWait: 240 * time.Millisecond,
 			PartialCancelGrow:  1,
 			PromotePartialOnFinal: true,
 			SkipBackgroundRefine:  true,
@@ -38,10 +40,10 @@ func SegmentPolicyFor(source, srcLang string) StreamSegmentPolicy {
 	case "韩语":
 		return StreamSegmentPolicy{
 			MinRunes: 10, MaxRunes: 0,
-			PartialMinTail: 3, PartialMinChars: 1,
-			PartialMinInterval: 60 * time.Millisecond,
-			PartialPromoteWait: 450 * time.Millisecond,
-			PartialCancelGrow:  1,
+			PartialMinTail: 5, PartialMinChars: 1,
+			PartialMinInterval: 38 * time.Millisecond,
+			PartialPromoteWait: 320 * time.Millisecond,
+			PartialCancelGrow:  2,
 			PromotePartialOnFinal: true,
 			AllowWeakSplit: true, AllowSpaceSplit: true,
 			DisableClauseFlush: true,
@@ -50,32 +52,46 @@ func SegmentPolicyFor(source, srcLang string) StreamSegmentPolicy {
 		return StreamSegmentPolicy{
 			MinRunes: 10, MaxRunes: 0,
 			PartialMinTail: 2, PartialMinChars: 1,
-			PartialMinInterval: 50 * time.Millisecond,
-			PartialPromoteWait: 450 * time.Millisecond,
+			PartialMinInterval: 42 * time.Millisecond,
+			PartialPromoteWait: 360 * time.Millisecond,
 			PartialCancelGrow:  1,
 			PromotePartialOnFinal: true,
 			AllowWeakSplit: true, AllowSpaceSplit: false,
 			DisableClauseFlush: true,
 		}
 	case "俄语":
-		// 俄语→中:整句单条 + 预览秒升 + 后台精修(与英/日/韩隔离)。
+		// 俄语→中:碎段合并兜底可读;预览参数对齐法德,避免过慢。
 		return StreamSegmentPolicy{
 			MinRunes: 16, MaxRunes: 0,
-			PartialMinTail: 10, PartialMinChars: 3,
-			PartialMinInterval: 90 * time.Millisecond,
-			PartialPromoteWait: 450 * time.Millisecond,
+			PartialMinTail: 8, PartialMinChars: 2,
+			PartialMinInterval: 55 * time.Millisecond,
+			PartialPromoteWait: 260 * time.Millisecond,
 			PartialCancelGrow:  2,
+			MergeShortUtterances:  true,
 			PromotePartialOnFinal: true,
 			AllowWeakSplit: false, AllowSpaceSplit: true,
 			DisableClauseFlush: true,
 		}
-	case "法语", "德语":
-		// 法/德→中:整句单条,预览跟嘴,定稿秒升后 Pro 精修。
+	case "法语":
+		// 法语→中:碎段合并 + 预览秒升;略快于德/西,减少短句两行。
+		return StreamSegmentPolicy{
+			MinRunes: 16, MaxRunes: 0,
+			PartialMinTail: 7, PartialMinChars: 2,
+			PartialMinInterval: 50 * time.Millisecond,
+			PartialPromoteWait: 260 * time.Millisecond,
+			PartialCancelGrow:  2,
+			MergeShortUtterances:  true,
+			PromotePartialOnFinal: true,
+			AllowWeakSplit: false, AllowSpaceSplit: true,
+			DisableClauseFlush: true,
+		}
+	case "德语":
+		// 德→中:整句单条,预览跟嘴,定稿秒升后 Pro 精修。
 		return StreamSegmentPolicy{
 			MinRunes: 18, MaxRunes: 0,
-			PartialMinTail: 12, PartialMinChars: 4,
-			PartialMinInterval: 100 * time.Millisecond,
-			PartialPromoteWait: 420 * time.Millisecond,
+			PartialMinTail: 8, PartialMinChars: 2,
+			PartialMinInterval: 55 * time.Millisecond,
+			PartialPromoteWait: 300 * time.Millisecond,
 			PartialCancelGrow:  2,
 			PromotePartialOnFinal: true,
 			AllowWeakSplit: false, AllowSpaceSplit: true,
@@ -90,10 +106,14 @@ func SegmentPolicyFor(source, srcLang string) StreamSegmentPolicy {
 			DisableClauseFlush: true,
 		}
 	case "西班牙语":
-		// 西语暂沿用旧欧美默认,与英/法/德/俄优化隔离。
+		// 西语→中:与法德同档,整句单条 + 预览秒升 + 后台精修。
 		return StreamSegmentPolicy{
-			MinRunes: 20, MaxRunes: 0, PartialMinTail: 20,
-			PartialMinChars: 10, PartialMinInterval: 250 * time.Millisecond,
+			MinRunes: 16, MaxRunes: 0,
+			PartialMinTail: 8, PartialMinChars: 2,
+			PartialMinInterval: 55 * time.Millisecond,
+			PartialPromoteWait: 300 * time.Millisecond,
+			PartialCancelGrow:  2,
+			PromotePartialOnFinal: true,
 			AllowWeakSplit: false, AllowSpaceSplit: true,
 			DisableClauseFlush: true,
 		}
@@ -151,7 +171,38 @@ func DetectPrimaryLanguage(text string) string {
 	if kana > 0 && kana*2 >= han {
 		return "日语"
 	}
+	if latin > 0 && best == "英语" {
+		if guessed := detectLatinLanguage(text); guessed != "" {
+			return guessed
+		}
+	}
 	return best
+}
+
+// detectLatinLanguage 根据变音符号等特征区分法/德/西(自动检测时避免一律走英语策略)。
+func detectLatinLanguage(text string) string {
+	var fr, de, es int
+	for _, r := range text {
+		switch r {
+		case 'é', 'è', 'ê', 'ë', 'à', 'â', 'î', 'ï', 'ô', 'ù', 'û', 'ç', 'œ', 'æ',
+			'É', 'È', 'Ê', 'À', 'Â', 'Î', 'Ô', 'Ù', 'Ç':
+			fr++
+		case 'ä', 'ö', 'ü', 'ß', 'Ä', 'Ö', 'Ü':
+			de++
+		case 'ñ', 'Ñ', '¿', '¡':
+			es++
+		}
+	}
+	if fr >= 2 && fr >= de && fr >= es {
+		return "法语"
+	}
+	if de >= 2 && de >= fr && de >= es {
+		return "德语"
+	}
+	if es >= 1 && es >= fr && es >= de {
+		return "西班牙语"
+	}
+	return ""
 }
 
 func unicodeIsHan(r rune) bool {

@@ -87,22 +87,19 @@ func TestASRNeedsNostream(t *testing.T) {
 	}
 }
 
-func TestASREndWindowSizeJapaneseOnly(t *testing.T) {
-	if got := ASREndWindowSize("日语"); got != 75 {
-		t.Fatalf("日语 end_window=%d, want 75", got)
+func TestASREndWindowSizeByLanguage(t *testing.T) {
+	cases := map[string]int{
+		"日语": 60,
+		"韩语": 175,
+		"法语": 145,
+		"德语": 130,
+		"俄语": 160,
+		"西班牙语": 130,
 	}
-	if got := ASREndWindowSize("法语"); got != 82 {
-		t.Fatalf("法语 end_window=%d, want 82", got)
-	}
-	if got := ASREndWindowSize("德语"); got != 82 {
-		t.Fatalf("德语 end_window=%d, want 82", got)
-	}
-	if got := ASREndWindowSize("俄语"); got != 82 {
-		t.Fatalf("俄语 end_window=%d, want 82", got)
-	}
-	ko := ASREndWindowSize("韩语")
-	if ko != config.ASRRequest.EndWindowSizeNostream {
-		t.Fatalf("韩语 end_window=%d, want nostream default %d", ko, config.ASRRequest.EndWindowSizeNostream)
+	for lang, want := range cases {
+		if got := ASREndWindowSize(lang); got != want {
+			t.Fatalf("%s end_window=%d, want %d", lang, got, want)
+		}
 	}
 	if got := ASREndWindowSize("英语"); got != config.ASRRequest.EndWindowSize {
 		t.Fatalf("英语 end_window=%d, want async %d", got, config.ASRRequest.EndWindowSize)

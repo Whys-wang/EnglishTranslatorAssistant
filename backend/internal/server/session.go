@@ -382,12 +382,93 @@ func (s *session) onASREvent(ev asr.Event) {
 				// 定稿句子:走正式翻译(带上下文 + 纠错 + TTS)。
 				s.enqueueTranslate(segID, u.Text, u.StartTime, u.EndTime)
 			} else if config.Translate.PartialPreview {
-				// 边说边译:对说话中的句子做节流翻译,实时顶出预览译文,
-				// 句子定稿后再被正式译文原地覆盖。
-				s.maybeTranslatePartial(segID, u.Text, u.StartTime, u.EndTime)
+				srcLang, _ := s.languages()
+				policy := translate.SegmentPolicyFor(u.Text, srcLang)
+				if !policy.SkipPartialPreview {
+					// 边说边译:对说话中的句子做节流翻译,实时顶出预览译文,
+					// 句子定稿后再被正式译文原地覆盖。
+					s.maybeTranslatePartial(segID, u.Text, u.StartTime, u.EndTime)
+				}
 			}
 		}
 	}
+}
+
+// tryMergeUtterance 把 ASR 连续短定稿并入上一条字幕,减少俄语等「两三词一行」。
+func (s *session) tryMergeUtterance(segID, source string, start, end int) (string, string, int, int, bool) {
+	srcLang, _ := s.languages()
+	policy := translate.SegmentPolicyFor(source, srcLang)
+	if !policy.MergeShortUtterances {
+		return segID, source, start, end, false
+	}
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return segID, source, start, end, false
+	}
+
+	s.segMu.Lock()
+	defer s.segMu.Unlock()
+
+	if len(s.order) == 0 {
+		return segID, source, start, end, false
+	}
+	prevID := s.order[len(s.order)-1]
+	if prevID == segID {
+		return segID, source, start, end, false
+	}
+	prev := s.segments[prevID]
+	if prev == nil {
+		return segID, source, start, end, false
+	}
+
+	prevSrc := strings.TrimSpace(prev.source)
+	newRunes := len([]rune(source))
+	prevRunes := len([]rune(prevSrc))
+	gap := start - prev.endTime
+	if gap < 0 {
+		gap = 0
+	}
+
+	const maxGapMS = 1500
+	const shortRunes = 32
+	shouldMerge := gap <= maxGapMS &&
+		(newRunes <= shortRunes || prevRunes <= shortRunes || prevRunes+newRunes <= 64)
+	if !shouldMerge {
+		return segID, source, start, end, false
+	}
+	if prevSrc == source || strings.HasSuffix(prevSrc, source) {
+		prev.endTime = end
+		return prevID, prevSrc, prev.startTime, end, true
+	}
+
+	merged := prevSrc
+	if merged != "" {
+		merged += " "
+	}
+	merged += source
+	prev.source = merged
+	prev.endTime = end
+	if prev.translated {
+		prev.translated = false
+		prev.revised = true
+	}
+
+	if st, ok := s.segments[segID]; ok && st != nil && len(s.order) > 0 && s.order[len(s.order)-1] == segID {
+		s.order = s.order[:len(s.order)-1]
+		delete(s.segments, segID)
+		_ = st
+	}
+	delete(s.lastSent, segID)
+
+	if s.log != nil {
+		s.log.Debug("utterance merged",
+			slog.String("into", prevID),
+			slog.String("dropped", segID),
+			slog.Int("gap_ms", gap),
+			slog.Int("merged_runes", len([]rune(merged))),
+		)
+	}
+	return prevID, merged, prev.startTime, end, true
 }
 
 // enqueueTranslate 记录/更新 segment 状态并把它加入翻译队列(非阻塞)。
@@ -396,6 +477,15 @@ func (s *session) onASREvent(ev asr.Event) {
 // 返回了不同的原文,则视为「修订」。开启 EnableASRRevision 时重新翻译并打
 // corrected 标记;关闭时仅更新原文记录、不重译。
 func (s *session) enqueueTranslate(segID, source string, start, end int) {
+	if mergedID, mergedSrc, mStart, mEnd, ok := s.tryMergeUtterance(segID, source, start, end); ok {
+		dropped := segID
+		segID, source, start, end = mergedID, mergedSrc, mStart, mEnd
+		s.partMu.Lock()
+		delete(s.partState, dropped)
+		delete(s.partState, mergedID)
+		s.partMu.Unlock()
+	}
+
 	s.segMu.Lock()
 	st, ok := s.segments[segID]
 	if !ok {

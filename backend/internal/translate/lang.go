@@ -112,12 +112,20 @@ func ASRNeedsNostream(srcLang string) bool {
 }
 
 // ASREndWindowSize 返回 ASR 判停(ms)。仅对指定语种微调;英/韩/中等其余语种走 config 默认。
+// 判停过短会在句中停顿处过早 definite,导致一句拆成多条字幕;法德俄西略拉长以整句输出。
 func ASREndWindowSize(srcLang string) int {
 	switch NormalizeLang(srcLang) {
 	case "日语":
-		return 75
-	case "法语", "德语", "俄语":
-		return 82
+		return 60
+	case "韩语":
+		return 175
+	case "俄语":
+		// 此前 280ms 过长;碎段由 MergeShortUtterances 兜底,判停可与法德接近。
+		return 160
+	case "法语":
+		return 145
+	case "德语", "西班牙语":
+		return 130
 	}
 	if ASRNeedsNostream(srcLang) {
 		if config.ASRRequest.EndWindowSizeNostream > 0 {

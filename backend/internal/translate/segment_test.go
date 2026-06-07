@@ -45,10 +45,16 @@ func TestSegmentPolicyJapaneseNoMidSplit(t *testing.T) {
 	}
 }
 
-func TestSegmentPolicyKoreanUnchanged(t *testing.T) {
+func TestSegmentPolicyKoreanOptimized(t *testing.T) {
 	p := SegmentPolicyFor("안녕하세요", "韩语")
-	if !p.PromotePartialOnFinal || p.PartialMinInterval != 60*time.Millisecond {
-		t.Fatalf("韩语 policy changed unexpectedly: %+v", p)
+	if !p.PromotePartialOnFinal || !p.DisableClauseFlush {
+		t.Fatalf("韩语应保持整句单条+秒升: %+v", p)
+	}
+	if p.PartialMinInterval != 38*time.Millisecond {
+		t.Fatalf("韩语预览间隔=%v, want 38ms", p.PartialMinInterval)
+	}
+	if p.PartialMinTail < 4 {
+		t.Fatalf("韩语预览尾部长度应>=4: %d", p.PartialMinTail)
 	}
 }
 
@@ -67,8 +73,31 @@ func TestDetectPrimaryLanguage(t *testing.T) {
 	}
 }
 
+func TestSegmentPolicyRussianLowLatency(t *testing.T) {
+	p := SegmentPolicyFor("Я сейчас говорю по-русски о семейном подкасте.", "俄语")
+	if !p.DisableClauseFlush || !p.PromotePartialOnFinal || !p.MergeShortUtterances {
+		t.Fatalf("俄语应整句+秒升+碎段合并: %+v", p)
+	}
+	if p.SkipPartialPreview {
+		t.Fatal("俄语应开启预览以降低延迟")
+	}
+	if p.PartialMinInterval != 55*time.Millisecond {
+		t.Fatalf("俄语预览间隔=%v, want 55ms", p.PartialMinInterval)
+	}
+}
+
+func TestSegmentPolicyFrenchMerge(t *testing.T) {
+	p := SegmentPolicyFor("Je parle lentement en français.", "法语")
+	if !p.MergeShortUtterances || !p.PromotePartialOnFinal || !p.DisableClauseFlush {
+		t.Fatalf("法语应整句+合并+秒升: %+v", p)
+	}
+	if p.PartialMinInterval != 50*time.Millisecond {
+		t.Fatalf("法语预览间隔=%v, want 50ms", p.PartialMinInterval)
+	}
+}
+
 func TestSegmentPolicyEuropeanPromote(t *testing.T) {
-	for _, lang := range []string{"法语", "德语", "俄语"} {
+	for _, lang := range []string{"德语", "西班牙语"} {
 		p := SegmentPolicyFor("test source text here.", lang)
 		if !p.DisableClauseFlush || !p.PromotePartialOnFinal {
 			t.Fatalf("%s should use single-line + promote, got %+v", lang, p)
@@ -76,6 +105,21 @@ func TestSegmentPolicyEuropeanPromote(t *testing.T) {
 		if p.PartialMinTail >= 20 {
 			t.Fatalf("%s partial tail too high: %d", lang, p.PartialMinTail)
 		}
+		if p.PartialMinInterval > 100*time.Millisecond {
+			t.Fatalf("%s preview interval too slow: %v", lang, p.PartialMinInterval)
+		}
+	}
+}
+
+func TestDetectLatinLanguage(t *testing.T) {
+	if got := DetectPrimaryLanguage("C'était très bien, merci."); got != "法语" {
+		t.Fatalf("french => %q", got)
+	}
+	if got := DetectPrimaryLanguage("Schöne Grüße aus München."); got != "德语" {
+		t.Fatalf("german => %q", got)
+	}
+	if got := DetectPrimaryLanguage("¿Cómo estás hoy?"); got != "西班牙语" {
+		t.Fatalf("spanish => %q", got)
 	}
 }
 
