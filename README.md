@@ -25,60 +25,28 @@
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 仓库三部分(职责不同,不要混为一谈)
-
-| 目录/文件 | 类型 | 干什么 | 会不会被 `go run` / 扩展加载执行 |
-|---|---|---|---|
-| **`backend/`** | **运行时代码** | Go 中继服务:收 PCM → ASR → 翻译 → 纠错 →(可选)TTS | ✅ 要启动 |
-| **`extension/`** | **运行时代码** | 浏览器扩展:抓标签页音频、显示桌宠与字幕、连后端 WS | ✅ 要加载 |
-| **`docs/`** | **静态资源** | README 引用的截图 PNG,不参与编译与运行 | ❌ 仅展示 |
-| **`README.md`**(根目录) | **说明文档** | 安装、配置、演示脚本、FAQ | ❌ 仅阅读 |
-
-GitHub 文件列表里若三个文件夹旁都显示 `docs:` 提交,是因为**最近只改了文档/截图/示例配置**,不代表三个目录功能相同——见上表。
-
-### `backend/` — 后端服务(核心逻辑)
+### 目录结构
 
 ```
-backend/
-├── main.go                 # 入口:启动 HTTP/WS 监听
-├── go.mod / go.sum
-└── internal/
-    ├── config/             # 密钥与参数(config.go 本地填写,不入库)
-    ├── logging/            # 结构化日志
-    ├── asr/                # 火山 ASR 流式(二进制协议、断线重连)
-    ├── translate/          # 方舟翻译、分句策略、多语种、术语表、译文清洗
-    ├── tts/                # 火山 TTS 双向流式 V3(会话连接复用)
-    └── server/             # WebSocket 中继、会话状态、纠错调度、字幕下发
+.
+├── backend/                  # Go 后端(WebSocket 中继 + 纠错逻辑)
+│   ├── main.go
+│   ├── go.mod
+│   └── internal/
+│       ├── config/           # ★ 所有密钥与可调参数写死在此(不读环境变量)
+│       ├── logging/          # 结构化日志(记录 X-Tt-Logid)
+│       ├── asr/              # 火山 ASR 流式客户端(二进制协议)
+│       ├── translate/        # 方舟翻译、分句策略、术语表、语种路由
+│       ├── tts/              # 火山 TTS 双向流式 V3(连接复用)
+│       └── server/           # WebSocket 中继、会话、纠错调度
+└── extension/                # Chrome/Edge 扩展 (Manifest V3)
+    ├── manifest.json
+    ├── background.js         # Service Worker:抓音授权、状态、消息转发
+    ├── offscreen.html/.js    # 音频采集 + WebSocket 推流 + TTS 播放
+    ├── audio-worklet.js      # 16kHz PCM 重采样 + VAD(里程碑 2)
+    ├── content.js + overlay.css  # 桌宠控制台 + 滚动字幕 overlay
+    └── popup.html/.js        # 遗留弹窗页(未挂 default_popup;主入口为扩展图标/快捷键 + 桌宠)
 ```
-
-本地运行:`cd backend && go run .` → 监听 `8765`,路径 `/ws`。
-
-### `extension/` — 浏览器扩展(用户界面与抓音)
-
-```
-extension/
-├── manifest.json           # 扩展清单(权限、快捷键、版本号)
-├── background.js           # Service Worker:tabCapture 授权、启停、消息路由
-├── offscreen.html/.js      # 隐藏页:AudioWorklet 推流、收字幕/TTS、WS 重连
-├── audio-worklet.js        # 16kHz PCM 重采样 + 静音/有声 VAD
-├── content.js              # 桌宠面板、语言选择、字幕滚动与纠错高亮
-├── overlay.css             # 桌宠与字幕条样式
-└── popup.html/.js          # 遗留弹窗(未挂 default_popup;主入口为图标/快捷键+桌宠)
-```
-
-加载方式:`chrome://extensions` 或 `edge://extensions` → 加载已解压 → 选 `extension/`。
-
-### `docs/` — 文档配图(不含业务代码)
-
-```
-docs/
-├── run-subtitles.png       # 成品预览:页面底部滚动字幕
-├── run-extension.png       # 成品预览:扩展已启用
-├── run-pet-panel.png       # 成品预览:桌宠控制面板
-└── product-preview.png     # 早期预览图(保留)
-```
-
-仅被 README「成品预览」引用;改截图**不影响**翻译功能,改 `backend/` 或 `extension/` 才会影响运行行为。
 
 ## 配置(写死,不用环境变量)
 
