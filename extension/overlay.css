@@ -535,3 +535,9 @@
   opacity: 0.45;
   pointer-events: none;
 }
+
+#__simul_interpreter_pet__ .si-pet-silence-hint {
+  font-size: 11px;
+  color: #888;
+  white-space: nowrap;
+}
